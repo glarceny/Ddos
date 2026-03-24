@@ -642,11 +642,11 @@ def menu_manage_servers(data):
             print(f"\n{COLOR['yellow']}Testing all servers...{COLOR['reset']}")
             
             def test_single(server, idx):
-    print(f"\n[{idx+1}/{len(data['servers'])}] Testing {server['host']}...")
-    if test_server(server):
-        server['active'] = True
-    else:
-        server['active'] = False
+                print(f"\n[{idx+1}/{len(data['servers'])}] Testing {server['host']}...")
+                if test_server(server):
+                    server['active'] = True
+                else:
+                    server['active'] = False
             
             threads = []
             for i, server in enumerate(data['servers']):
