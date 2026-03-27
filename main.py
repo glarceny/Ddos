@@ -690,6 +690,7 @@ def menu_password_servers(data):
 
 def menu_key_servers(data):
     """Manage servers that use SSH key authentication"""
+    global DEFAULT_KEY_FILE  # Deklarasi global di awal fungsi
     while True:
         clear_screen()
         print_banner()
@@ -852,8 +853,8 @@ def menu_key_servers(data):
             input("\nEnter to continue...")
             
         elif choice == '6':
+            # Global DEFAULT_KEY_FILE already declared at function start
             new_key = input(f"Enter new default private key path [{DEFAULT_KEY_FILE}]: ") or DEFAULT_KEY_FILE
-            global DEFAULT_KEY_FILE
             DEFAULT_KEY_FILE = new_key
             print(f"{COLOR['green']}✅ Global private key path set to {DEFAULT_KEY_FILE}{COLOR['reset']}")
             time.sleep(1)
