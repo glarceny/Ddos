@@ -13,7 +13,7 @@ import socket
 import select
 import random
 
-# ================= [ KONFIGURASI ] =================
+# ================= [ KONFIGGURASI ] =================
 DB_FILE = "servers.json"
 DEFAULT_KEY_FILE = os.path.expanduser("~/.ssh/id_rsa")
 
