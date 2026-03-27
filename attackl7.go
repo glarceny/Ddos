@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
+	"github.com/gorilla/websocket"
 )
 
 // ==================== TEMPLATE VARIABLES ====================
