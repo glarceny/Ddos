@@ -1,0 +1,23 @@
+{
+  "servers": [
+    {
+      "host": "152.42.217.160",
+      "username": "root",
+      "password": "ASTRAL#4VCPU8GBINTEL",
+      "port": 22,
+      "added": 1774375648.080186,
+      "active": true,
+      "cpu_cores": 4,
+      "ram_mb": 7937,
+      "bandwidth": 1949.98,
+      "latency": 1.427,
+      "cpu_model": "model name\t: DO-Premium-Intel"
+    }
+  ],
+  "stats": {
+    "total_attacks": 19,
+    "total_packets": 713700000,
+    "total_bytes": 0,
+    "total_time": 8100.498591661453
+  }
+}
